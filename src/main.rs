@@ -14,46 +14,49 @@ mod test;
 use std::{thread, time::Duration, sync::{Arc}, collections::{HashSet, HashMap}};
 use parking_lot::Mutex;
 
+use rand::Rng;
 use simple_logger::SimpleLogger;
 
 use node::Node;
-use raft::{NetworkMessage, CommandRequest};
-use transport::{MockTransport, Transport};
+use raft::{NetworkMessage, CommandRequest, NodeID};
+use transport::{Transport, ChannelMockTransport};
 
 
 fn main() {
 
-    SimpleLogger::new().init().unwrap();
-    let n = 3;
+    SimpleLogger::new().without_timestamps().init().unwrap();
+    let n = 9;
 
-    let mut transport = MockTransport::new(0..=0);
+    let mut transport = ChannelMockTransport::new(10..=200);
 
     let mut nodes = Vec::new();
 
     let node_set = HashSet::from_iter(0..n);
 
     for i in 0..n {
-        nodes.push(Arc::new(Mutex::new(Node::new(i, node_set.clone(), HashMap::new()))));
+        nodes.push(Node::new(i, node_set.clone(), HashMap::new()));
     }
 
-    let mut inboxes = HashMap::new();
+    let mut senders = HashMap::new();
     for (i, node) in nodes.iter().enumerate() {
-        inboxes.insert(i, node.lock().get_inbox());
+        senders.insert(i, node.get_sender());
     }
 
-    transport.setup_inboxes(inboxes);
-    let transport_arc = Arc::new(transport);
+    transport.setup_senders(senders);
+    let arc_transport = Arc::new(transport);
 
-    for node in nodes {
-        let transport_clone = transport_arc.clone();
-        thread::spawn(move || node.lock().start(transport_clone));
+    for mut node in nodes {
+        let arc_transport_clone = arc_transport.clone();
+        thread::spawn(move || node.start(arc_transport_clone));
     }
    
+    thread::sleep(Duration::from_secs(10));
+
+    for i in 0..25 {
+        let tgt = rand::thread_rng().gen_range(0..n);
+        arc_transport.send(tgt, NetworkMessage::CommandRequest(
+            CommandRequest{command: format!("SET X {}", i)}));
+    }
+
     thread::sleep(Duration::from_secs(5));
-
-    transport_arc.send(2, NetworkMessage::CommandRequest(CommandRequest{command: "SET X 5".to_string()}));
-
-
-    thread::sleep(Duration::from_secs(1));
-
 }

@@ -1,7 +1,8 @@
 use rand::prelude::*;
 use std::cmp::min;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, mpsc};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 
 use crate::raft::{
     CommandRequest, LogEntry, LogRequest, LogResponse, NetworkMessage, NodeID, Role, VoteRequest,
@@ -11,10 +12,11 @@ use crate::state::StateMachine;
 use crate::transport::Transport;
 use crate::utils::{self, get_time_ms};
 
-use parking_lot::Mutex;
+// should be long, allow time for elections to reach all nodes
+const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=5000;
 
-const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=2000;
-const HEARTBEAT_INTERVAL_MS: u128 = 250;
+ // should be very low, need establish authority and stop other elections
+const HEARTBEAT_INTERVAL_MS: u128 = 50;
 
 pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static> {
     // stable
@@ -36,7 +38,8 @@ pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static>
     t_heartbeat_sent: u128,
     election_timeout: u128,
     t_election_start: u128,
-    inbox: Arc<Mutex<VecDeque<NetworkMessage>>>,
+    sender: SyncSender<NetworkMessage>,
+    receiver: Receiver<NetworkMessage>,
     nodes: HashSet<NodeID>,
     transport: Option<Arc<T>>,
     pub state: S,
@@ -44,6 +47,7 @@ pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static>
 
 impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     pub fn new(id: usize, nodes: HashSet<NodeID>, state: S) -> Self {
+        let (rx, tx) = mpsc::sync_channel(100_000);
         log::info!("[Node {}]Initializing node", id);
         Node {
             id,
@@ -63,7 +67,8 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             t_heartbeat_sent: 0, // 0?
             election_timeout: rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS), // 0? since we set on become follower
             t_election_start: 0,                                                 // 0?
-            inbox: Arc::new(Mutex::new(VecDeque::new())),
+            sender: rx, 
+            receiver: tx,
             nodes,
             transport: None,
             state,
@@ -353,6 +358,12 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             && (request.prefix_lenth == 0
                 || self.log[request.prefix_lenth - 1].term == request.prefix_term);
 
+        if !log_ok {
+            // if we short circuit on the && or ||, the call to self.log[request.prefix_lenth - 1] will panic
+            log::warn!("{} rejecting log, log.len={}, prefix_len={}, log{:?}, prefix_term={}",
+                self.dbg(), self.log.len(), request.prefix_lenth, &self.log, request.prefix_term);
+        }
+
         if request.term == self.current_term && log_ok {
             // if terms match and log is ok, append and ack success
             let ack = request.prefix_lenth + request.suffix.len();
@@ -400,9 +411,9 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
         // append new log entries
         if prefix_len + suffix.len() > self.log.len() {
-            // todo: sketchy
+
             let take_start = self.log.len() - prefix_len;
-            let take_n = (suffix.len() - 1) - take_start;
+            let take_n = (suffix.len()) - take_start; // take inclusive, needed to remove -1
             let entries = suffix.into_iter().skip(take_start).take(take_n);
 
             for entry in entries {
@@ -427,6 +438,12 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 self.acked_length.insert(response.sender, response.ack);
                 self.commit_log_entries();
             } else if self.sent_length[&response.sender] > 0 {
+                log::error!("{} follower failed to log: success={}, ack={} vs last ack={}",
+                    self.dbg(),
+                    response.success,
+                    response.ack,
+                    self.acked_length[&response.sender]);
+
                 // if send fails, maybe gap in follower log.
                 // decrement to try and shrink prefix, sending one more log
                 // on next attempt.
@@ -469,13 +486,12 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         self.transport.as_ref().unwrap().send(node, message);
     }
 
-    pub fn get_inbox(&self) -> Arc<Mutex<VecDeque<NetworkMessage>>> {
-        self.inbox.clone()
+    pub fn get_sender(&self) -> SyncSender<NetworkMessage> {
+        self.sender.clone()
     }
 
     fn get_next_message(&self) -> Option<NetworkMessage> {
-        let mut locked_inbox = self.inbox.lock();
-        locked_inbox.pop_front()
+        self.receiver.try_recv().ok()
     }
 
     // todo: this must be FIFO to preserve total ordering
@@ -484,6 +500,8 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             log::warn!("No leader, discarding message {}", message.command);
             return;
         }
+
+        log::info!("{} forwarding {:?} to leader {}", self.dbg(), message, leader.unwrap());
 
         // will fail if no leader, need queue to hold until leader elected and send in order
         self.transport
@@ -507,6 +525,6 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             Some(id) => id.to_string(),
             None => "None".to_string(),
         };
-        format!("[Node {} | Term {} | Leader {}]", self.id, self.current_term, leader)
+        format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }
 }
