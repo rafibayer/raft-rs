@@ -1,9 +1,7 @@
+use rand::prelude::*;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc};
-use std::thread;
-use std::time::Duration;
-use rand::prelude::*;
+use std::sync::Arc;
 
 use crate::raft::{
     CommandRequest, LogEntry, LogRequest, LogResponse, NetworkMessage, NodeID, Role, VoteRequest,
@@ -11,10 +9,12 @@ use crate::raft::{
 };
 use crate::state::StateMachine;
 use crate::transport::Transport;
-use crate::utils;
+use crate::utils::{self, get_time_ms};
 
-use log;
 use parking_lot::Mutex;
+
+const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=2000;
+const HEARTBEAT_INTERVAL_MS: u128 = 250;
 
 pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static> {
     // stable
@@ -32,13 +32,14 @@ pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static>
     pub acked_length: HashMap<NodeID, usize>,
 
     // implementation details
-    election_running: bool,
+    t_heartbeat_received: u128,
+    t_heartbeat_sent: u128,
+    election_timeout: u128,
+    t_election_start: u128,
     inbox: Arc<Mutex<VecDeque<NetworkMessage>>>,
-    self_mutex: Option<Arc<Mutex<Node<S, T>>>>,
     nodes: HashSet<NodeID>,
     transport: Option<Arc<T>>,
     pub state: S,
-    pub last_heartbeat_unix: u128,
 }
 
 impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
@@ -58,37 +59,96 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             acked_length: HashMap::new(),
 
             // implementation details
-            election_running: false,
+            t_heartbeat_received: utils::get_time_ms(),
+            t_heartbeat_sent: 0, // 0?
+            election_timeout: rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS), // 0? since we set on become follower
+            t_election_start: 0,                                                 // 0?
             inbox: Arc::new(Mutex::new(VecDeque::new())),
-            self_mutex: None,
             nodes,
             transport: None,
             state,
-            last_heartbeat_unix: utils::get_time_ms()
         }
     }
 
-    pub fn start(&mut self, mutex: Arc<Mutex<Node<S, T>>>, transport: Arc<T>) {
-        log::info!("[Node {}] starting...", self.id);
-
+    pub fn start(&mut self, transport: Arc<T>) {
+        log::info!("{} starting...", self.dbg());
         self.transport = Some(transport);
-        self.self_mutex = Some(mutex);
-        self.start_election();
-        self.start_inbox();
-        self.start_heartbeat();
+        self.become_follower(0);
     }
 
-    fn request_votes(&mut self) {
-        log::info!("[Node {}] requesting votes", self.id);
-        // become candidate, vote for self
-        self.current_term += 1;
+    fn become_follower(&mut self, term: usize) -> ! {
+        self.voted_for = None;
+        self.current_role = Role::Follower;
+        self.current_term = term;
+        self.election_timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS);
+
+        loop {
+            if let Some(message) = self.get_next_message() {
+                self.process_message(message);
+            }
+
+            // check for heartbeat timeout
+            if utils::get_time_ms() > self.t_heartbeat_received + self.election_timeout {
+                log::warn!(
+                    "{} (FOLW) has not received heartbeat, becoming candidate",
+                    self.dbg()
+                );
+                self.become_candidate();
+            }
+        }
+    }
+
+    fn become_candidate(&mut self) -> ! {
         self.current_role = Role::Candidate;
+        self.current_term += 1;
         self.voted_for = Some(self.id);
         self.votes_received.clear();
         self.votes_received.insert(self.id);
+        self.t_election_start = utils::get_time_ms();
 
+        self.request_votes();
+
+        loop {
+            if let Some(message) = self.get_next_message() {
+                self.process_message(message);
+            }
+
+            // check for election timeout
+            if utils::get_time_ms() > self.t_election_start + self.election_timeout {
+                log::warn!("{} (CAND) election timeout, restarting election", self.dbg());
+                self.become_candidate();
+            }
+        }
+    }
+
+    fn become_leader(&mut self) -> ! {
+        self.current_role = Role::Leader;
+        self.current_leader = Some(self.id);
+
+        // replicate logs to other nodes
+        for follower in &self.nodes {
+            if *follower != self.id {
+                self.sent_length.insert(*follower, self.log.len());
+                self.acked_length.insert(*follower, 0);
+                self.replicate_log(follower);
+            }
+        }
+
+        loop {
+            if let Some(message) = self.get_next_message() {
+                self.process_message(message);
+            }
+
+            if utils::get_time_ms() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL_MS {
+                log::info!("{} (LEAD) heartbeat timeout, sending heartbeat", self.dbg());
+                self.send_heartbeat();
+            }
+        }
+    }
+
+    fn request_votes(&mut self) {
         let mut last_term = 0;
-        if self.log.len() > 0 {
+        if !self.log.is_empty() {
             last_term = self.log[self.log.len() - 1].term;
         }
 
@@ -100,37 +160,32 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                     log_length: self.log.len(),
                     last_log_term: last_term,
                 };
-                log::info!("[Node {}] requesting vote from Node {}", self.id, node);
                 self.send_message(*node, NetworkMessage::VoteRequest(request));
             }
         }
-
-        self.election_running = true;
     }
 
     pub fn receive_vote_request(&mut self, request: VoteRequest) {
-        log::info!(
-            "[Node {}] received vote request from Node {}",
-            self.id,
-            request.sender
-        );
+        log::info!("{} received vote request from Node {}", self.dbg(), request.sender);
+
+        let mut should_become_follower = false;
 
         // if we see a higher term, step down
         if request.term > self.current_term {
             log::error!(
-                "[Node {}] Found higher term: current_term = {} but node {} had term {}",
-                self.id,
+                "{} Found higher term: current_term = {} but node {} had term {}",
+                self.dbg(),
                 self.current_term,
                 request.sender,
                 request.term
             );
+            // have to set term here since it is used in request validation
             self.current_term = request.term;
-            self.current_role = Role::Follower;
-            self.voted_for = None;
+            should_become_follower = true;
         }
 
         let mut last_term = 0;
-        if self.log.len() > 0 {
+        if !self.log.is_empty() {
             last_term = self.log[self.log.len() - 1].term;
         }
 
@@ -140,7 +195,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
         // if the requestors term is current, log is healthy, and we haven't voted yet, vote yes
         if request.term == self.current_term && log_ok && self.voted_for == None {
-            log::info!("[Node {}] voting for Node {}", self.id, request.sender);
+            log::info!("{} voting for Node {}", self.dbg(), request.sender);
 
             self.voted_for = Some(request.sender);
             self.send_message(
@@ -153,9 +208,9 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             );
         } else {
             log::warn!(
-                "[Node {}] will not vote for Node {}
+                "{} will not vote for Node {}
                 request.term = {}, current_term = {}, log_ok = {}, vote_for = {:?}",
-                self.id,
+                self.dbg(),
                 request.sender,
                 request.term,
                 self.current_term,
@@ -172,74 +227,59 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }),
             );
         }
+
+        if should_become_follower {
+            // we already fixed term above
+            self.become_follower(self.current_term);
+        }
     }
 
     pub fn receive_vote_response(&mut self, response: VoteResponse) {
-        log::info!(
-            "[Node {}] received vote response from Node {}",
-            self.id,
-            response.voter
-        );
+        log::info!("{} received vote response from Node {}", self.dbg(), response.voter);
 
         if self.current_role == Role::Candidate
             && response.term == self.current_term
             && response.granted
         {
-            log::info!(
-                "[Node {}] received granted vote from {}",
-                self.id,
-                response.voter
-            );
+            log::info!("{} received granted vote from {}", self.dbg(), response.voter);
 
             self.votes_received.insert(response.voter);
 
             // check for quorum
             if self.votes_received.len() >= (self.nodes.len() + 1) / 2 {
                 log::info!(
-                    "[Node {}] ****** received a quorum with {} votes ******",
-                    self.id,
+                    "{} ****** received a quorum with {} votes ******",
+                    self.dbg(),
                     self.votes_received.len()
                 );
 
-                self.current_role = Role::Leader;
-                self.current_leader = Some(self.id);
-
-                self.election_running = false;
-
-                // replicate logs to other nodes
+                // replicate log, assume leader role
                 for follower in &self.nodes {
                     if *follower != self.id {
                         self.sent_length.insert(*follower, self.log.len());
                         self.acked_length.insert(*follower, 0);
-
                         self.replicate_log(follower);
                     }
                 }
+
+                self.become_leader();
             }
         } else if response.term > self.current_term {
             log::error!(
-                "[Node {}] Stepping down. received a vote response with a higher term {} vs {}",
-                self.id,
+                "{} Stepping down. received a vote response with a higher term {} vs {}",
+                self.dbg(),
                 response.term,
                 self.current_term
             );
 
-            // step down if we see a higher term
-            self.current_term = response.term;
-            self.current_role = Role::Follower;
-            self.voted_for = None;
-
-            self.election_running = false;
+            self.become_follower(response.term);
         }
     }
 
     pub fn broadcast_request(&mut self, message: CommandRequest) {
         if self.current_role == Role::Leader {
-            log::info!("[Node {}] received broadcast request as leader", self.id);
-            self.log.push(LogEntry {
-                command: message.command,
-                term: self.current_term,
-            });
+            log::info!("{} received broadcast request as leader", self.dbg());
+            self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
             for follower in &self.nodes {
@@ -248,17 +288,16 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }
             }
         } else {
-            log::info!("[Node {}] received broadcast request as follower, forwarding.", self.id);
+            log::info!("{} received broadcast request as follower, forwarding.", self.dbg());
             self.forward(self.current_leader, message);
         }
     }
 
-    fn heartbeat(&mut self) {
-        if self.current_role == Role::Leader {
-            for follower in &self.nodes {
-                if *follower != self.id {
-                    self.replicate_log(follower);
-                }
+    fn send_heartbeat(&mut self) {
+        self.t_heartbeat_sent = utils::get_time_ms();
+        for follower in &self.nodes {
+            if *follower != self.id {
+                self.replicate_log(follower);
             }
         }
     }
@@ -290,29 +329,26 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     pub fn receive_log_request(&mut self, request: LogRequest) {
-        self.last_heartbeat_unix = utils::get_time_ms();
-        
+        let mut should_become_follower = false;
+
+        self.t_heartbeat_received = get_time_ms();
+
         if request.term > self.current_term {
             self.current_term = request.term;
             self.voted_for = None;
-
-            self.election_running = false;
         }
 
         // above, we accepted current_term = term, so we always
         // fall through to this if-statement as well if
         // the first executed
         if request.term == self.current_term {
-            self.current_role = Role::Follower;
+            // instead of transitioning immediately, finish processing log first
+            should_become_follower = true;
             self.current_leader = Some(request.leader_id);
         }
 
         // check that we have the prefix that the sender is assuming we have
-        // (or longer).
-        // AND
-        // prefix length is 0
-        //      OR last log term in prefix on follower = last log term on leader
-
+        // and last log term in prefix on follower = last log term on leader
         let log_ok = (self.log.len() >= request.prefix_lenth)
             && (request.prefix_lenth == 0
                 || self.log[request.prefix_lenth - 1].term == request.prefix_term);
@@ -342,11 +378,15 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }),
             )
         }
+
+        if should_become_follower {
+            self.become_follower(self.current_term);
+        }
     }
 
     fn append_entries(&mut self, prefix_len: usize, leader_commit: usize, suffix: Vec<LogEntry>) {
         // check if we have anything to append
-        if suffix.len() > 0 && self.log.len() > prefix_len {
+        if !suffix.is_empty() && self.log.len() > prefix_len {
             // last log entry we can compare between follower state and leader state.
             let index = min(self.log.len(), prefix_len + suffix.len()) - 1;
 
@@ -372,9 +412,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
         if leader_commit > self.commit_length {
             for i in self.commit_length..leader_commit - 1 {
-                self.state
-                    .apply_command(&self.log[i].command)
-                    .expect("err applying command");
+                self.state.apply_command(&self.log[i].command).expect("err applying command");
             }
 
             self.commit_length = leader_commit;
@@ -387,7 +425,6 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             if response.success && response.ack >= self.acked_length[&response.sender] {
                 self.sent_length.insert(response.sender, response.ack);
                 self.acked_length.insert(response.sender, response.ack);
-
                 self.commit_log_entries();
             } else if self.sent_length[&response.sender] > 0 {
                 // if send fails, maybe gap in follower log.
@@ -399,11 +436,8 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             }
         } else if response.term > self.current_term {
             // as usual, step down if we see higher term
-            self.current_term = response.term;
-            self.current_role = Role::Follower;
-            self.voted_for = None;
-
-            self.election_running = false;
+            self.t_heartbeat_received = get_time_ms();
+            self.become_follower(response.term);
         }
     }
 
@@ -431,12 +465,17 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     fn send_message(&self, node: NodeID, message: NetworkMessage) {
-        log::info!("[Node {}] sending message {:?} to Node {}", self.id, message, node);
-            self.transport.as_ref().unwrap().send(node, message);
+        log::info!("{} sending message {:?} to Node {}", self.dbg(), message, node);
+        self.transport.as_ref().unwrap().send(node, message);
     }
 
     pub fn get_inbox(&self) -> Arc<Mutex<VecDeque<NetworkMessage>>> {
         self.inbox.clone()
+    }
+
+    fn get_next_message(&self) -> Option<NetworkMessage> {
+        let mut locked_inbox = self.inbox.lock();
+        locked_inbox.pop_front()
     }
 
     // todo: this must be FIFO to preserve total ordering
@@ -456,82 +495,18 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     fn process_message(&mut self, message: NetworkMessage) {
         match message {
             NetworkMessage::CommandRequest(command) => self.broadcast_request(command),
-            NetworkMessage::LogRequest(log_req) => self.receive_log_request(log_req),
-            NetworkMessage::LogResponse(log_resp) => self.recieve_log_response(log_resp),
             NetworkMessage::VoteRequest(vote_req) => self.receive_vote_request(vote_req),
             NetworkMessage::VoteResponse(vote_resp) => self.receive_vote_response(vote_resp),
+            NetworkMessage::LogRequest(log_req) => self.receive_log_request(log_req),
+            NetworkMessage::LogResponse(log_resp) => self.recieve_log_response(log_resp),
         }
     }
 
-    fn start_election(&mut self) {
-        Node::run_election_loop_thread(self.id, self.self_mutex.clone().unwrap());
+    fn dbg(&self) -> String {
+        let leader = match self.current_leader {
+            Some(id) => id.to_string(),
+            None => "None".to_string(),
+        };
+        format!("[Node {} | Term {} | Leader {}]", self.id, self.current_term, leader)
     }
-
-    fn start_inbox(&mut self) {
-        Node::run_process_message_loop_thread(self.id, self.inbox.clone(), self.self_mutex.clone().unwrap())
-    }
-
-    fn start_heartbeat(&mut self) {
-        Node::run_heartbeat_loop_thread(self.id, self.self_mutex.clone().unwrap());
-    }
-
-    fn run_election_loop_thread(id: NodeID, node: Arc<Mutex<Node<S, T>>>){
-        
-        let election_timeout_ms = rand::thread_rng().gen_range(500..1000u128); 
-
-        thread::spawn(move || loop {
-
-            if let Some(mut node_lock) = node.try_lock() {
-                if node_lock.election_running {
-                    log::info!("[Node {}] acquired lock in election loop", id);
-
-                    if utils::get_time_ms() > node_lock.last_heartbeat_unix + election_timeout_ms {
-                        node_lock.request_votes();
-                    }
-                    
-                    log::info!("[Node {}] released lock in election loop", id);
-                }
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        });
-    }
-
-    fn run_process_message_loop_thread(id: NodeID, inbox: Arc<Mutex<VecDeque<NetworkMessage>>>, node: Arc<Mutex<Node<S, T>>>) {
-        // yield after at most this many messages
-        let process_limit = 10; 
-        
-        thread::spawn(move || loop {
-            let mut processed = 0;
-
-            if let Some(mut node_lock) = node.try_lock() {
-                log::info!("[Node {}] acquired lock in inbox loop", id);
-
-                let mut inbox_lock = inbox.lock();
-                log::info!("[Node {}] inbox length: {}", id, inbox_lock.len());
-                
-                while !inbox_lock.is_empty() && processed < process_limit {
-                    node_lock.process_message(inbox_lock.pop_front().unwrap());
-                    processed += 1;
-                }
-
-                log::info!("[Node {}] released lock in inbox loop after {} messages", id, processed);
-            }
-
-            thread::sleep(Duration::from_millis(100));
-        });
-    }
-
-    fn run_heartbeat_loop_thread(id: NodeID, node: Arc<Mutex<Node<S, T>>>) {
-        thread::spawn(move || loop {
-
-            if let Some(mut node_lock) = node.try_lock_for(Duration::from_millis(500)) {
-                log::info!("[Node {}] acquired lock in heartbeat loop", id);
-                node_lock.heartbeat();
-            }
-
-            thread::sleep(Duration::from_millis(1000));
-        });
-    }
-
 }

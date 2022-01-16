@@ -1,7 +1,8 @@
 use parking_lot::Mutex;
+use rand::Rng;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::Arc, thread, time::Duration,
 };
 
 use crate::raft::{CommandRequest, NetworkMessage, NodeID};
@@ -20,12 +21,14 @@ pub trait Transport {
 
 pub struct MockTransport {
     pub inboxes: HashMap<NodeID, Inbox>,
+    network_delay_range: std::ops::RangeInclusive<u64>,
 }
 
 impl MockTransport {
-    pub fn new() -> Self {
+    pub fn new(network_delay_range: std::ops::RangeInclusive<u64>) -> Self {
         MockTransport {
             inboxes: HashMap::new(),
+            network_delay_range
         }
     }
 
@@ -36,7 +39,12 @@ impl MockTransport {
 
 impl Transport for MockTransport {
     fn send(&self, target: NodeID, message: NetworkMessage) {
-        self.inboxes[&target].lock().push_back(message);
+        let inbox = self.inboxes[&target].clone();
+        let delay = Duration::from_millis(rand::thread_rng().gen_range(self.network_delay_range.clone()));
+        thread::spawn(move || {
+            thread::sleep(delay);
+            inbox.lock().push_back(message);
+        });
     }
 
     fn send_fifo(&self, _sender: NodeID, _target: NodeID, _message: CommandRequest) {

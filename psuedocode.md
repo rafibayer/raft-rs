@@ -331,9 +331,9 @@ Role of Candidate
         - **Transition to Follower**
 
 Role of Leader
-    - send heartbeat
-    - process messages
-        - if we discover new term
-            - **Transition to Follower**
+- send heartbeat
+- process messages
+    - if we discover new term
+        - **Transition to Follower**
 
 

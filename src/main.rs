@@ -4,6 +4,10 @@ mod node;
 mod utils;
 mod transport;
 
+// thoughts: probably need to reset/stop election timer in more places.
+// I think we are assuming that only follower receives heartbeats
+// but candidate does to?? prob rewatch video/other impl
+
 #[cfg(test)]
 mod test;
 
@@ -18,10 +22,11 @@ use transport::{MockTransport, Transport};
 
 
 fn main() {
+
     SimpleLogger::new().init().unwrap();
     let n = 3;
 
-    let mut transport = MockTransport::new();
+    let mut transport = MockTransport::new(0..=0);
 
     let mut nodes = Vec::new();
 
@@ -32,44 +37,23 @@ fn main() {
     }
 
     let mut inboxes = HashMap::new();
-    for i in 0..n {
-        inboxes.insert(i, nodes[i].lock().get_inbox());
+    for (i, node) in nodes.iter().enumerate() {
+        inboxes.insert(i, node.lock().get_inbox());
     }
 
     transport.setup_inboxes(inboxes);
     let transport_arc = Arc::new(transport);
 
-    for i in 0..n {
-        nodes[i].lock().start(nodes[i].clone(), transport_arc.clone());
+    for node in nodes {
+        let transport_clone = transport_arc.clone();
+        thread::spawn(move || node.lock().start(transport_clone));
     }
+   
+    thread::sleep(Duration::from_secs(5));
 
-    transport_arc.send(0, NetworkMessage::CommandRequest(CommandRequest{command: "SET X 5".to_string()}));
+    transport_arc.send(2, NetworkMessage::CommandRequest(CommandRequest{command: "SET X 5".to_string()}));
 
-    monitor_deadlocks();
-    thread::sleep(Duration::from_secs(10000));
-}
 
-use parking_lot::deadlock;
+    thread::sleep(Duration::from_secs(1));
 
-fn monitor_deadlocks() {
-    
-    // Create a background thread which checks for deadlocks every 10s
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_millis(500));
-            let deadlocks = deadlock::check_deadlock();
-            if deadlocks.is_empty() {
-                continue;
-            }
-
-            println!("{} deadlocks detected", deadlocks.len());
-            for (i, threads) in deadlocks.iter().enumerate() {
-                println!("Deadlock #{}", i);
-                for t in threads {
-                    println!("Thread Id {:#?}", t.thread_id());
-                    println!("{:#?}", t.backtrace());
-                }
-            }
-        }
-    });
 }

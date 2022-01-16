@@ -13,7 +13,7 @@ impl StateMachine for HashMap<String, String> {
         let parts = command.splitn(3, " ").collect::<Vec<&str>>();
         match parts.len() {
             2 => {
-                self.get(parts[1]).cloned().ok_or("KEY NOT FOUND".to_string())
+                self.get(parts[1]).cloned().ok_or(String::from("KEY NOT FOUND"))
             },
             3 => {
                 self.insert(parts[1].to_string(), parts[2].to_string());
