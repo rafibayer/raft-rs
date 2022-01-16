@@ -1,7 +1,6 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
 use std::thread;
 use std::time::Duration;
 use rand::prelude::*;
@@ -15,6 +14,7 @@ use crate::transport::Transport;
 use crate::utils;
 
 use log;
+use parking_lot::Mutex;
 
 pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static> {
     // stable
@@ -32,16 +32,17 @@ pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static>
     pub acked_length: HashMap<NodeID, usize>,
 
     // implementation details
+    election_running: bool,
     inbox: Arc<Mutex<VecDeque<NetworkMessage>>>,
     self_mutex: Option<Arc<Mutex<Node<S, T>>>>,
     nodes: HashSet<NodeID>,
-    transport: Arc<Mutex<T>>,
+    transport: Option<Arc<T>>,
     pub state: S,
     pub last_heartbeat_unix: u128,
 }
 
 impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
-    pub fn new(id: usize, nodes: HashSet<NodeID>, transport: Arc<Mutex<T>>, state: S) -> Self {
+    pub fn new(id: usize, nodes: HashSet<NodeID>, state: S) -> Self {
         log::info!("[Node {}]Initializing node", id);
         Node {
             id,
@@ -57,21 +58,24 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             acked_length: HashMap::new(),
 
             // implementation details
-            self_mutex: None,
+            election_running: false,
             inbox: Arc::new(Mutex::new(VecDeque::new())),
+            self_mutex: None,
             nodes,
-            transport,
+            transport: None,
             state,
             last_heartbeat_unix: utils::get_time_ms()
         }
     }
 
-    pub fn start(&mut self, mutex: Arc<Mutex<Node<S, T>>>) {
+    pub fn start(&mut self, mutex: Arc<Mutex<Node<S, T>>>, transport: Arc<T>) {
         log::info!("[Node {}] starting...", self.id);
 
+        self.transport = Some(transport);
         self.self_mutex = Some(mutex);
         self.start_election();
         self.start_inbox();
+        self.start_heartbeat();
     }
 
     fn request_votes(&mut self) {
@@ -101,7 +105,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             }
         }
 
-        // todo: start election timer
+        self.election_running = true;
     }
 
     pub fn receive_vote_request(&mut self, request: VoteRequest) {
@@ -114,7 +118,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         // if we see a higher term, step down
         if request.term > self.current_term {
             log::error!(
-                "[Node {}] Stepping down: current_term = {} but {} had term {}",
+                "[Node {}] Found higher term: current_term = {} but node {} had term {}",
                 self.id,
                 self.current_term,
                 request.sender,
@@ -191,8 +195,8 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
             // check for quorum
             if self.votes_received.len() >= (self.nodes.len() + 1) / 2 {
-                log::trace!(
-                    "[Node {}] received a quorum with {} votes",
+                log::info!(
+                    "[Node {}] ****** received a quorum with {} votes ******",
                     self.id,
                     self.votes_received.len()
                 );
@@ -200,7 +204,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 self.current_role = Role::Leader;
                 self.current_leader = Some(self.id);
 
-                // todo: stop election timer
+                self.election_running = false;
 
                 // replicate logs to other nodes
                 for follower in &self.nodes {
@@ -225,7 +229,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             self.current_role = Role::Follower;
             self.voted_for = None;
 
-            // todo: stop election timer
+            self.election_running = false;
         }
     }
 
@@ -286,11 +290,13 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     pub fn receive_log_request(&mut self, request: LogRequest) {
+        self.last_heartbeat_unix = utils::get_time_ms();
+        
         if request.term > self.current_term {
             self.current_term = request.term;
             self.voted_for = None;
 
-            // todo: stop election timer
+            self.election_running = false;
         }
 
         // above, we accepted current_term = term, so we always
@@ -397,7 +403,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             self.current_role = Role::Follower;
             self.voted_for = None;
 
-            // todo: stop election timer
+            self.election_running = false;
         }
     }
 
@@ -426,7 +432,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
     fn send_message(&self, node: NodeID, message: NetworkMessage) {
         log::info!("[Node {}] sending message {:?} to Node {}", self.id, message, node);
-        self.transport.lock().unwrap().send(node, message);
+            self.transport.as_ref().unwrap().send(node, message);
     }
 
     pub fn get_inbox(&self) -> Arc<Mutex<VecDeque<NetworkMessage>>> {
@@ -435,11 +441,16 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
     // todo: this must be FIFO to preserve total ordering
     fn forward(&self, leader: Option<NodeID>, message: CommandRequest) {
+        if leader.is_none() {
+            log::warn!("No leader, discarding message {}", message.command);
+            return;
+        }
+
         // will fail if no leader, need queue to hold until leader elected and send in order
         self.transport
-            .lock()
+            .as_ref()
             .unwrap()
-            .send_fifo(self.id, leader.unwrap(), message);
+            .send(leader.unwrap(), NetworkMessage::CommandRequest(message));
     }
 
     fn process_message(&mut self, message: NetworkMessage) {
@@ -460,46 +471,66 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         Node::run_process_message_loop_thread(self.id, self.inbox.clone(), self.self_mutex.clone().unwrap())
     }
 
+    fn start_heartbeat(&mut self) {
+        Node::run_heartbeat_loop_thread(self.id, self.self_mutex.clone().unwrap());
+    }
+
     fn run_election_loop_thread(id: NodeID, node: Arc<Mutex<Node<S, T>>>){
         
-        let ELECTION_TIMEOUT_MS = rand::thread_rng().gen_range(500..1000u128); 
+        let election_timeout_ms = rand::thread_rng().gen_range(500..1000u128); 
 
         thread::spawn(move || loop {
-            log::info!("[Node {}] acquiring lock in election loop", id);
 
-            {
-                let mut locked = node.lock().unwrap();
-                if utils::get_time_ms() > locked.last_heartbeat_unix + ELECTION_TIMEOUT_MS {
-                    locked.request_votes();
+            if let Some(mut node_lock) = node.try_lock() {
+                if node_lock.election_running {
+                    log::info!("[Node {}] acquired lock in election loop", id);
+
+                    if utils::get_time_ms() > node_lock.last_heartbeat_unix + election_timeout_ms {
+                        node_lock.request_votes();
+                    }
+                    
+                    log::info!("[Node {}] released lock in election loop", id);
                 }
-            };
-            log::info!("[Node {}] released lock in election loop", id);
+            }
 
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(100));
         });
     }
 
     fn run_process_message_loop_thread(id: NodeID, inbox: Arc<Mutex<VecDeque<NetworkMessage>>>, node: Arc<Mutex<Node<S, T>>>) {
         // yield after at most this many messages
-        let PROCESS_LIMIT = 10; 
+        let process_limit = 10; 
         
         thread::spawn(move || loop {
             let mut processed = 0;
-            log::info!("[Node {}] acquiring lock in inbox loop", id);
 
-            {
-                let mut inbox_lock = inbox.lock().unwrap();
+            if let Some(mut node_lock) = node.try_lock() {
+                log::info!("[Node {}] acquired lock in inbox loop", id);
+
+                let mut inbox_lock = inbox.lock();
                 log::info!("[Node {}] inbox length: {}", id, inbox_lock.len());
-                let mut node_lock = node.lock().unwrap();
                 
-                while !inbox_lock.is_empty() && processed < PROCESS_LIMIT {
+                while !inbox_lock.is_empty() && processed < process_limit {
                     node_lock.process_message(inbox_lock.pop_front().unwrap());
                     processed += 1;
                 }
-            }
-            log::info!("[Node {}] released lock in inbox loop after {} messages", id, processed);
 
-            thread::sleep(Duration::from_millis(10));
+                log::info!("[Node {}] released lock in inbox loop after {} messages", id, processed);
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        });
+    }
+
+    fn run_heartbeat_loop_thread(id: NodeID, node: Arc<Mutex<Node<S, T>>>) {
+        thread::spawn(move || loop {
+
+            if let Some(mut node_lock) = node.try_lock_for(Duration::from_millis(500)) {
+                log::info!("[Node {}] acquired lock in heartbeat loop", id);
+                node_lock.heartbeat();
+            }
+
+            thread::sleep(Duration::from_millis(1000));
         });
     }
 

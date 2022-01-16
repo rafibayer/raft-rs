@@ -1,5 +1,8 @@
 # [Kleppmann Raft Lecture](https://www.youtube.com/watch?v=uXEYuDwm7e4)
-Notes: https://www.cl.cam.ac.uk/teaching/2122/ConcDisSys/dist-sys-notes.pdf
+Notes: https://www.cl.cam.ac.uk/teaching/2122/ConcDisSys/dist-sys-notes.pdf (page 60)
+
+
+![state](raft_state_transitions.png)
 
 ## slide (1/9) Initialization
 ```rs
@@ -306,5 +309,31 @@ fn COMMIT_LOG_ENTRIES(self: Node) {
     }
 }
 ```
+
+
+# Summary:
+
+Role of Follower:
+- Check for heartbeat of leader
+    - if we haven't see it for T:
+        - **Transition to Candidate**
+- process messages
+
+Role of Candidate
+- request votes
+    - if we receive quorum
+        - **Transition to Leader**
+    - if we timeout
+        - increment term
+        - **Transition to Candidate**
+- process messages
+    - if we discover new term
+        - **Transition to Follower**
+
+Role of Leader
+    - send heartbeat
+    - process messages
+        - if we discover new term
+            - **Transition to Follower**
 
 

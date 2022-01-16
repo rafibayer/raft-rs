@@ -9,3 +9,4 @@ edition = "2021"
 log = "0.4"
 simple_logger = "1.16.0"
 rand = "0.8.4"
+parking_lot = { version = "0.5.2", features = ["deadlock_detection"] }
