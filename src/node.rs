@@ -16,7 +16,7 @@ use crate::utils::{self, get_time_ms};
 const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=5000;
 
  // should be very low, need establish authority and stop other elections
-const HEARTBEAT_INTERVAL_MS: u128 = 50;
+const HEARTBEAT_INTERVAL_MS: u128 = 5;
 
 pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static> {
     // stable
@@ -78,32 +78,73 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     pub fn start(&mut self, transport: Arc<T>) {
         log::info!("{} starting...", self.dbg());
         self.transport = Some(transport);
-        self.become_follower(0);
+        self.node_loop();
     }
 
-    fn become_follower(&mut self, term: usize) -> ! {
+    fn node_loop(&mut self) -> ! {
+        loop {
+            match self.current_role {
+                Role::Follower => self.follower(),
+                Role::Candidate => self.candidate(),
+                Role::Leader => self.leader(),
+            };
+        }
+    }
+
+    fn follower(&mut self) -> Option<Role> {
+        if let Some(message) = self.get_next_message() {
+            self.process_message(message);
+        }
+
+        // check for heartbeat timeout
+        if utils::get_time_ms() > self.t_heartbeat_received + self.election_timeout {
+            log::warn!(
+                "{} (FOLW) has not received heartbeat, becoming candidate",
+                self.dbg()
+            );
+            self.become_candidate();
+            return Some(Role::Candidate);
+        }
+
+        None
+    }
+
+    fn candidate(&mut self) -> Option<Role> {
+        if let Some(message) = self.get_next_message() {
+            self.process_message(message);
+        }
+
+        // check for election timeout
+        if utils::get_time_ms() > self.t_election_start + self.election_timeout {
+            log::warn!("{} (CAND) election timeout, restarting election", self.dbg());
+            self.become_candidate();
+            return Some(Role::Candidate);
+        }
+
+        None
+    }
+
+    fn leader(&mut self) -> Option<Role> {
+        if let Some(message) = self.get_next_message() {
+            self.process_message(message);
+        }
+
+        if utils::get_time_ms() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL_MS {
+            log::info!("{} (LEAD) heartbeat timeout, sending heartbeat", self.dbg());
+            self.send_heartbeat();
+        }
+
+        None
+    }
+
+    fn become_follower(&mut self, term: usize) {
         self.voted_for = None;
         self.current_role = Role::Follower;
         self.current_term = term;
         self.election_timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS);
-
-        loop {
-            if let Some(message) = self.get_next_message() {
-                self.process_message(message);
-            }
-
-            // check for heartbeat timeout
-            if utils::get_time_ms() > self.t_heartbeat_received + self.election_timeout {
-                log::warn!(
-                    "{} (FOLW) has not received heartbeat, becoming candidate",
-                    self.dbg()
-                );
-                self.become_candidate();
-            }
-        }
     }
 
-    fn become_candidate(&mut self) -> ! {
+    fn become_candidate(&mut self) {
         self.current_role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -112,21 +153,9 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         self.t_election_start = utils::get_time_ms();
 
         self.request_votes();
-
-        loop {
-            if let Some(message) = self.get_next_message() {
-                self.process_message(message);
-            }
-
-            // check for election timeout
-            if utils::get_time_ms() > self.t_election_start + self.election_timeout {
-                log::warn!("{} (CAND) election timeout, restarting election", self.dbg());
-                self.become_candidate();
-            }
-        }
     }
 
-    fn become_leader(&mut self) -> ! {
+    fn become_leader(&mut self) {
         self.current_role = Role::Leader;
         self.current_leader = Some(self.id);
 
@@ -138,18 +167,9 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 self.replicate_log(follower);
             }
         }
-
-        loop {
-            if let Some(message) = self.get_next_message() {
-                self.process_message(message);
-            }
-
-            if utils::get_time_ms() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL_MS {
-                log::info!("{} (LEAD) heartbeat timeout, sending heartbeat", self.dbg());
-                self.send_heartbeat();
-            }
-        }
     }
+
+    
 
     fn request_votes(&mut self) {
         let mut last_term = 0;
@@ -170,7 +190,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         }
     }
 
-    pub fn receive_vote_request(&mut self, request: VoteRequest) {
+    pub fn receive_vote_request(&mut self, request: VoteRequest) -> Option<Role> {
         log::info!("{} received vote request from Node {}", self.dbg(), request.sender);
 
         let mut should_become_follower = false;
@@ -236,10 +256,13 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         if should_become_follower {
             // we already fixed term above
             self.become_follower(self.current_term);
+            return Some(Role::Follower);
         }
+
+        None
     }
 
-    pub fn receive_vote_response(&mut self, response: VoteResponse) {
+    pub fn receive_vote_response(&mut self, response: VoteResponse) -> Option<Role> {
         log::info!("{} received vote response from Node {}", self.dbg(), response.voter);
 
         if self.current_role == Role::Candidate
@@ -268,6 +291,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }
 
                 self.become_leader();
+                return Some(Role::Leader);
             }
         } else if response.term > self.current_term {
             log::error!(
@@ -278,10 +302,13 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             );
 
             self.become_follower(response.term);
+            return Some(Role::Follower);
         }
+
+        None
     }
 
-    pub fn broadcast_request(&mut self, message: CommandRequest) {
+    pub fn broadcast_request(&mut self, message: CommandRequest) -> Option<Role> {
         if self.current_role == Role::Leader {
             log::info!("{} received broadcast request as leader", self.dbg());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
@@ -296,6 +323,8 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             log::info!("{} received broadcast request as follower, forwarding.", self.dbg());
             self.forward(self.current_leader, message);
         }
+
+        None
     }
 
     fn send_heartbeat(&mut self) {
@@ -333,7 +362,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         )
     }
 
-    pub fn receive_log_request(&mut self, request: LogRequest) {
+    pub fn receive_log_request(&mut self, request: LogRequest) -> Option<Role> {
         let mut should_become_follower = false;
 
         self.t_heartbeat_received = get_time_ms();
@@ -391,8 +420,10 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         }
 
         if should_become_follower {
-            self.become_follower(self.current_term);
+            return Some(Role::Follower)
         }
+
+        None
     }
 
     fn append_entries(&mut self, prefix_len: usize, leader_commit: usize, suffix: Vec<LogEntry>) {
@@ -430,7 +461,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         }
     }
 
-    pub fn recieve_log_response(&mut self, response: LogResponse) {
+    pub fn recieve_log_response(&mut self, response: LogResponse) -> Option<Role> {
         if response.term == self.current_term && self.current_role == Role::Leader {
             // ensures ack > last ack, incase response re-ordered
             if response.success && response.ack >= self.acked_length[&response.sender] {
@@ -454,8 +485,10 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         } else if response.term > self.current_term {
             // as usual, step down if we see higher term
             self.t_heartbeat_received = get_time_ms();
-            self.become_follower(response.term);
+            return Some(Role::Follower);
         }
+
+        None
     }
 
     fn commit_log_entries(&mut self) {
@@ -510,7 +543,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             .send(leader.unwrap(), NetworkMessage::CommandRequest(message));
     }
 
-    fn process_message(&mut self, message: NetworkMessage) {
+    fn process_message(&mut self, message: NetworkMessage) -> Option<Role> {
         match message {
             NetworkMessage::CommandRequest(command) => self.broadcast_request(command),
             NetworkMessage::VoteRequest(vote_req) => self.receive_vote_request(vote_req),

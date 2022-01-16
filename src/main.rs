@@ -27,7 +27,7 @@ fn main() {
     SimpleLogger::new().without_timestamps().init().unwrap();
     let n = 9;
 
-    let mut transport = ChannelMockTransport::new(10..=200);
+    let mut transport = ChannelMockTransport::new(0..=0);
 
     let mut nodes = Vec::new();
 
