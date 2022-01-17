@@ -18,7 +18,7 @@ const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=5000;
 // should be very low, need establish authority and stop other elections
 const HEARTBEAT_INTERVAL_MS: u128 = 50;
 
-pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static> {
+pub struct Node<S: StateMachine + 'static, T: Transport + 'static> {
     // stable
     pub id: NodeID,
     pub current_term: usize,
@@ -45,10 +45,10 @@ pub struct Node<S: StateMachine + 'static, T: Transport + Send + Sync + 'static>
     pub state: S,
 }
 
-impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
+impl<S: StateMachine, T: Transport + 'static> Node<S, T> {
     pub fn new(id: usize, nodes: HashSet<NodeID>, state: S) -> Self {
         let (rx, tx) = mpsc::sync_channel(100_000);
-        log::info!("[Node {}]Initializing node", id);
+        log::info!("[Node {}] Initializing...", id);
         Node {
             id,
             current_term: 0,
@@ -76,15 +76,13 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     pub fn start(&mut self, transport: Arc<T>) {
-        log::info!("{} starting...", self.dbg());
+        log::info!("{} starting", self.dbg());
         self.transport = Some(transport);
         self.node_loop();
     }
 
     fn node_loop(&mut self) -> ! {
         loop {
-
-
             // process messages and check for transitions
             let next_role = if let Some(transition) = self.process_next_message() {
                 Some(transition)
@@ -97,8 +95,11 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }
             };
 
-            // transition if needed
+            // transition if needed.
+            // we process transitions even to the same role, because this could represent
+            // incrementing follwer term when stepping down, or restarting an election.
             if let Some(transition) = next_role {
+                // log::warn!("{} transitioning to {:?}", self.dbg(), transition);
                 match transition {
                     RoleTransition::Follower { term } => self.become_follower(term),
                     RoleTransition::Candidate => self.become_candidate(),
@@ -130,7 +131,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
     fn leader(&mut self) -> Option<RoleTransition> {
         if get_time_ms() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL_MS {
-            log::info!("{} heartbeat timeout, sending heartbeat", self.dbg());
+            log::trace!("{} heartbeat timeout, sending heartbeat", self.dbg());
             self.send_heartbeat();
         }
 
@@ -139,7 +140,6 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
     fn become_follower(&mut self, term: usize) {
         self.current_role = Role::Follower;
-        self.voted_for = None;
         self.current_term = term;
         self.election_timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS);
     }
@@ -189,13 +189,13 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     pub fn receive_vote_request(&mut self, request: VoteRequest) -> Option<RoleTransition> {
-        log::info!("{} received vote request from Node {}", self.dbg(), request.sender);
+        log::trace!("{} received vote request from Node {}", self.dbg(), request.sender);
 
         let mut should_become_follower = false;
 
         // if we see a higher term, step down
         if request.term > self.current_term {
-            log::error!(
+            log::warn!(
                 "{} Found higher term: current_term = {} but node {} had term {}",
                 self.dbg(),
                 self.current_term,
@@ -204,6 +204,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             );
             // have to set term here since it is used in request validation
             self.current_term = request.term;
+            self.voted_for = None; // must reset our vote, since it was for an old term
             should_become_follower = true;
         }
 
@@ -218,7 +219,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
         // if the requestors term is current, log is healthy, and we haven't voted yet, vote yes
         if request.term == self.current_term && log_ok && self.voted_for == None {
-            log::info!("{} voting for Node {}", self.dbg(), request.sender);
+            log::trace!("{} voting for Node {}", self.dbg(), request.sender);
 
             self.voted_for = Some(request.sender);
             self.send_message(
@@ -251,6 +252,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             );
         }
 
+        // if we voted yes, we should NOT be resetting vote here but we do
         if should_become_follower {
             // we already fixed term above
             return Some(RoleTransition::Follower{term: self.current_term});
@@ -260,13 +262,25 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     pub fn receive_vote_response(&mut self, response: VoteResponse) -> Option<RoleTransition> {
-        log::info!("{} received vote response from Node {}", self.dbg(), response.voter);
+        log::trace!("{} received vote response from Node {}", self.dbg(), response.voter);
+
+        // check for higher term on vote response;
+        if response.term > self.current_term {
+            log::warn!(
+                "{} Stepping down. received a vote response with a higher term {} vs {}",
+                self.dbg(),
+                response.term,
+                self.current_term
+            );
+            self.voted_for = None; // must reset our vote, since it was for an old term
+            return Some(RoleTransition::Follower{term: response.term});
+        }
 
         if self.current_role == Role::Candidate
             && response.term == self.current_term
             && response.granted
         {
-            log::info!("{} received granted vote from {}", self.dbg(), response.voter);
+            log::trace!("{} received granted vote from {}", self.dbg(), response.voter);
 
             self.votes_received.insert(response.voter);
 
@@ -289,15 +303,6 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
                 return Some(RoleTransition::Leader);
             }
-        } else if response.term > self.current_term {
-            log::error!(
-                "{} Stepping down. received a vote response with a higher term {} vs {}",
-                self.dbg(),
-                response.term,
-                self.current_term
-            );
-
-            return Some(RoleTransition::Follower{term: response.term});
         }
 
         None
@@ -305,7 +310,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
     pub fn broadcast_request(&mut self, message: CommandRequest) -> Option<RoleTransition> {
         if self.current_role == Role::Leader {
-            log::info!("{} received broadcast request as leader", self.dbg());
+            log::trace!("{} received broadcast request as leader", self.dbg());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
@@ -315,7 +320,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
                 }
             }
         } else {
-            log::info!("{} received broadcast request as follower, forwarding.", self.dbg());
+            log::trace!("{} received broadcast request as follower, forwarding.", self.dbg());
             self.forward(self.current_leader, message);
         }
 
@@ -364,7 +369,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
 
         if request.term > self.current_term {
             self.current_term = request.term;
-            self.voted_for = None;
+            self.voted_for = None; // must reset vote, as it is for an older term
         }
 
         // above, we accepted current_term = term, so we always
@@ -518,7 +523,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
     }
 
     fn send_message(&self, node: NodeID, message: NetworkMessage) {
-        log::info!("{} sending message {:?} to Node {}", self.dbg(), message, node);
+        log::trace!("{} sending message {:?} to Node {}", self.dbg(), message, node);
         self.transport.as_ref().unwrap().send(node, message);
     }
 
@@ -538,7 +543,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
             return;
         }
 
-        log::info!("{} forwarding {:?} to leader {}", self.dbg(), message, leader.unwrap());
+        log::trace!("{} forwarding {:?} to leader {}", self.dbg(), message, leader.unwrap());
 
         // will fail if no leader, need queue to hold until leader elected and send in order
         self.transport
@@ -560,6 +565,7 @@ impl<S: StateMachine, T: Transport + Send + Sync + 'static> Node<S, T> {
         } 
     }
 
+    #[inline]
     fn dbg(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }

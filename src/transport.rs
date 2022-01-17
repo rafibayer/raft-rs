@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::mpsc::SyncSender, thread, time::Duration};
 
 use crate::raft::{CommandRequest, NetworkMessage, NodeID};
 
-pub trait Transport {
+pub trait Transport: Sync + Send {
     fn send(&self, target: NodeID, message: NetworkMessage);
     fn send_fifo(&self, sender: NodeID, target: NodeID, message: CommandRequest);
 }

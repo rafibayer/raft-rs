@@ -22,10 +22,10 @@ use transport::{Transport, ChannelMockTransport};
 
 fn main() {
 
-    SimpleLogger::new().without_timestamps().init().unwrap();
-    let n = 3;
+    SimpleLogger::new().with_level(log::LevelFilter::Trace).without_timestamps().init().unwrap();
+    let n = 5;
 
-    let mut transport = ChannelMockTransport::new(10..=50);
+    let mut transport = ChannelMockTransport::new(0..=0);
 
     let mut nodes = Vec::new();
 
