@@ -92,7 +92,7 @@ impl<S: Storage> Node<S> {
     }
 
     pub fn start(&mut self) {
-        log::info!("{} starting", self.dbg());
+        log::info!("{} starting", self.stamp());
         self.event_loop();
     }
 
@@ -131,7 +131,7 @@ impl<S: Storage> Node<S> {
 
         // check for heartbeat timeout
         if Instant::now() > self.t_heartbeat_received + self.election_timeout {
-            log::warn!("{} has not received heartbeat, becoming candidate", self.dbg());
+            log::warn!("{} has not received heartbeat, becoming candidate", self.stamp());
             return Some(RoleTransition::Candidate);
         }
 
@@ -141,7 +141,7 @@ impl<S: Storage> Node<S> {
     fn candidate(&mut self) -> Option<RoleTransition> {
         // check for election timeout
         if Instant::now() > self.t_election_start + self.election_timeout {
-            log::warn!("{} election timeout reached, restarting election", self.dbg());
+            log::warn!("{} election timeout reached, restarting election", self.stamp());
             return Some(RoleTransition::Candidate);
         }
 
@@ -150,7 +150,7 @@ impl<S: Storage> Node<S> {
 
     fn leader(&mut self) -> Option<RoleTransition> {
         if Instant::now() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL {
-            log::trace!("{} heartbeat timeout, sending heartbeat", self.dbg());
+            log::trace!("{} heartbeat timeout, sending heartbeat", self.stamp());
             self.send_heartbeat();
         }
 
@@ -208,7 +208,7 @@ impl<S: Storage> Node<S> {
     }
 
     fn receive_vote_request(&mut self, request: VoteRequest) -> Option<RoleTransition> {
-        log::trace!("{} received vote request from Node {}", self.dbg(), request.sender);
+        log::trace!("{} received vote request from Node {}", self.stamp(), request.sender);
 
         let mut should_become_follower = false;
 
@@ -216,7 +216,7 @@ impl<S: Storage> Node<S> {
         if request.term > self.current_term {
             log::warn!(
                 "{} Found higher term: current_term = {} but node {} had term {}",
-                self.dbg(),
+                self.stamp(),
                 self.current_term,
                 request.sender,
                 request.term
@@ -238,7 +238,7 @@ impl<S: Storage> Node<S> {
 
         // if the requestors term is current, log is healthy, and we haven't voted yet, vote yes
         if request.term == self.current_term && log_ok && self.voted_for == None {
-            log::trace!("{} voting for Node {}", self.dbg(), request.sender);
+            log::trace!("{} voting for Node {}", self.stamp(), request.sender);
 
             self.voted_for = Some(request.sender);
             self.send_message(
@@ -253,7 +253,7 @@ impl<S: Storage> Node<S> {
             log::warn!(
                 "{} will not vote for Node {}
                 request.term = {}, current_term = {}, log_ok = {}, vote_for = {:?}",
-                self.dbg(),
+                self.stamp(),
                 request.sender,
                 request.term,
                 self.current_term,
@@ -281,13 +281,13 @@ impl<S: Storage> Node<S> {
     }
 
     fn receive_vote_response(&mut self, response: VoteResponse) -> Option<RoleTransition> {
-        log::trace!("{} received vote response from Node {}", self.dbg(), response.voter);
+        log::trace!("{} received vote response from Node {}", self.stamp(), response.voter);
 
         // check for higher term on vote response;
         if response.term > self.current_term {
             log::warn!(
                 "{} Stepping down. received a vote response with a higher term {} vs {}",
-                self.dbg(),
+                self.stamp(),
                 response.term,
                 self.current_term
             );
@@ -299,15 +299,15 @@ impl<S: Storage> Node<S> {
             && response.term == self.current_term
             && response.granted
         {
-            log::trace!("{} received granted vote from {}", self.dbg(), response.voter);
+            log::trace!("{} received granted vote from {}", self.stamp(), response.voter);
 
             self.votes_received.insert(response.voter);
 
             // check for quorum
-            if self.votes_received.len() >= (self.nodes.len() + 1) / 2 {
+            if self.votes_received.len() >= (self.nodes.len() / 2) + 1 {
                 log::info!(
                     "{} ****** received a quorum with {} votes ******",
-                    self.dbg(),
+                    self.stamp(),
                     self.votes_received.len()
                 );
 
@@ -329,7 +329,7 @@ impl<S: Storage> Node<S> {
 
     fn broadcast_request(&mut self, message: CommandRequest) -> Option<RoleTransition> {
         if self.current_role == Role::Leader {
-            log::trace!("{} received broadcast request as leader", self.dbg());
+            log::trace!("{} received broadcast request as leader", self.stamp());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
@@ -339,7 +339,7 @@ impl<S: Storage> Node<S> {
                 }
             }
         } else {
-            log::trace!("{} received broadcast request as follower, forwarding.", self.dbg());
+            log::trace!("{} received broadcast request as follower, forwarding.", self.stamp());
             self.forward(message);
         }
 
@@ -410,7 +410,7 @@ impl<S: Storage> Node<S> {
             // if we short circuit on the && or ||, the call to self.log[request.prefix_lenth - 1] will panic
             log::warn!(
                 "{} rejecting log, log.len={}, prefix_len={}, log{:?}, prefix_term={}",
-                self.dbg(),
+                self.stamp(),
                 self.log.len(),
                 request.prefix_lenth,
                 &self.log,
@@ -503,7 +503,7 @@ impl<S: Storage> Node<S> {
             } else if self.sent_length[&response.sender] > 0 {
                 log::warn!(
                     "{} follower failed to log: success={}, ack={} vs last ack={}",
-                    self.dbg(),
+                    self.stamp(),
                     response.success,
                     response.ack,
                     self.acked_length[&response.sender]
@@ -532,7 +532,7 @@ impl<S: Storage> Node<S> {
             }
 
             // check for quorum
-            if acks >= (self.nodes.len() + 1) / 2 {
+            if acks >= (self.nodes.len() / 2) + 1 {
                 self.state
                     .apply_command(&self.log[self.commit_length].command)
                     .expect("err applying command");
@@ -545,7 +545,7 @@ impl<S: Storage> Node<S> {
     }
 
     fn send_message(&self, node: NodeID, message: MessageData) {
-        log::trace!("{} sending message {:?} to Node {}", self.dbg(), message, node);
+        log::trace!("{} sending message {:?} to Node {}", self.stamp(), message, node);
         self.transport.send(Message { destination: node, message }).unwrap();
     }
 
@@ -578,6 +578,12 @@ impl<S: Storage> Node<S> {
         }
     }
 
+    // todo: optimistic message processing.
+    // we can perhaps get up to N messages from the channel and process them if no transition.
+    // must not pull message until after done with last so we don't lose messages in a transition.
+    // e.g. imagine processing results [None, None, Follower, ...].
+    // once we transition to follower, we still must process everything after, but if we've pulled it from the queue
+    // we probably need to return early to transition in the event_loop.
     fn process_next_message(&mut self) -> Option<RoleTransition> {
         match self.get_next_message() {
             Some(MessageData::CommandRequest(command)) => self.broadcast_request(command),
@@ -590,7 +596,7 @@ impl<S: Storage> Node<S> {
     }
 
     #[inline]
-    fn dbg(&self) -> String {
+    fn stamp(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }
 }

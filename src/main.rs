@@ -22,7 +22,7 @@ use transport::{channel_mock_transport::{ChannelMockTransport, NodeChannel}};
 fn main() {
 
     SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
-    let n = 11;
+    let n = 12;
 
     // collection of nodes and corresponding channels
     let mut new_nodes = Vec::new();

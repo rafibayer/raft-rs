@@ -15,7 +15,7 @@ fn test_startup() {
     let node_set = HashSet::from_iter(0..n);
 
     for i in 0..n {
-        nodes.push(Node::new(i, node_set.clone(), HashMap::new()));
+        nodes.push(Node::new_node(i, node_set.clone(), HashMap::new()));
     }
 
     let mut node_channels = HashMap::new();
