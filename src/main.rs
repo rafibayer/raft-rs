@@ -3,6 +3,7 @@ mod state;
 mod node;
 mod utils;
 mod transport;
+mod server;
 
 // thoughts: probably need to reset/stop election timer in more places.
 // I think we are assuming that only follower receives heartbeats
@@ -17,15 +18,14 @@ use rand::Rng;
 use simple_logger::SimpleLogger;
 
 use node::Node;
-use raft::{NetworkMessage, CommandRequest};
-use transport::{Transport, ChannelMockTransport};
+use raft::{Message, CommandRequest};
+use transport::{Transport, channel_mock_transport::{ChannelMockTransport, NodeChannel}};
 
 fn main() {
 
-    SimpleLogger::new().with_level(log::LevelFilter::Trace).without_timestamps().init().unwrap();
+    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
     let n = 5;
 
-    let mut transport = ChannelMockTransport::new(0..=0);
 
     let mut nodes = Vec::new();
 
@@ -35,26 +35,21 @@ fn main() {
         nodes.push(Node::new(i, node_set.clone(), HashMap::new()));
     }
 
-    let mut senders = HashMap::new();
-    for (i, node) in nodes.iter().enumerate() {
-        senders.insert(i, node.get_sender());
-    }
-
-    transport.setup_senders(senders);
-    let arc_transport = Arc::new(transport);
-
+    let mut node_channels = HashMap::new();
     for mut node in nodes {
-        let arc_transport_clone = arc_transport.clone();
-        thread::spawn(move || node.start(arc_transport_clone));
+        
+        node_channels.insert(node.node.id, NodeChannel {
+            sender: node.sender,
+            receiver: node.receiver,
+        });
+
+        thread::spawn(move || node.node.start());
     }
-   
+
+    let transport = ChannelMockTransport::new(0..=0, node_channels);
+    thread::spawn(move|| {
+        transport.start();
+    });
+
     thread::sleep(Duration::from_secs(10));
-
-    for i in 0..25 {
-        let tgt = rand::thread_rng().gen_range(0..n);
-        arc_transport.send(tgt, NetworkMessage::CommandRequest(
-            CommandRequest{command: format!("SET X {}", i)}));
-    }
-
-    thread::sleep(Duration::from_secs(25));
 }

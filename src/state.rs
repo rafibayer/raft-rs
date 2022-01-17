@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-pub trait StateMachine: Sync + Send {
+pub trait Storage: Sync + Send {
     fn apply_command(&mut self, command: &str) -> Result<String, String>;
 }
 
-impl StateMachine for HashMap<String, String> {
+impl Storage for HashMap<String, String> {
     
     //! Command formats: 
     //!     GET <KEY>

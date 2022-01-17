@@ -3,17 +3,13 @@ use std::{sync::{Arc}, collections::{HashMap, HashSet}, thread, time::Duration};
 use rand::Rng;
 use simple_logger::SimpleLogger;
 
-use crate::{transport::{ChannelMockTransport, Transport}, node::Node, raft::{NetworkMessage, CommandRequest}};
-
-
+use crate::{transport::{channel_mock_transport::{ChannelMockTransport, NodeChannel}}, node::Node, raft::{CommandRequest}};
 
 
 #[test]
 fn test_startup() {
-    SimpleLogger::new().without_timestamps().init().unwrap();
-    let n = 15;
-
-    let mut transport = ChannelMockTransport::new(10..=50);
+    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    let n = 5;
 
     let mut nodes = Vec::new();
 
@@ -23,26 +19,21 @@ fn test_startup() {
         nodes.push(Node::new(i, node_set.clone(), HashMap::new()));
     }
 
-    let mut senders = HashMap::new();
-    for (i, node) in nodes.iter().enumerate() {
-        senders.insert(i, node.get_sender());
-    }
-
-    transport.setup_senders(senders);
-    let arc_transport = Arc::new(transport);
-
+    let mut node_channels = HashMap::new();
     for mut node in nodes {
-        let arc_transport_clone = arc_transport.clone();
-        thread::spawn(move || node.start(arc_transport_clone));
+        
+        node_channels.insert(node.node.id, NodeChannel {
+            sender: node.sender,
+            receiver: node.receiver,
+        });
+
+        thread::spawn(move || node.node.start());
     }
-   
+
+    let transport = ChannelMockTransport::new(0..=0, node_channels);
+    thread::spawn(move|| {
+        transport.start();
+    });
+
     thread::sleep(Duration::from_secs(10));
-
-    for i in 0..25 {
-        let tgt = rand::thread_rng().gen_range(0..n);
-        arc_transport.send(tgt, NetworkMessage::CommandRequest(
-            CommandRequest{command: format!("SET X {}", i)}));
-    }
-
-    thread::sleep(Duration::from_secs(25));
 }

@@ -26,7 +26,13 @@ pub struct CommandRequest {
 }
 
 #[derive(Debug)]
-pub enum NetworkMessage {
+pub struct Message {
+    pub destination: NodeID,
+    pub message: MessageData
+}
+
+#[derive(Debug)]
+pub enum MessageData {
     // client requests
     CommandRequest(CommandRequest),
 
