@@ -1,25 +1,28 @@
-use rand::prelude::*;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{mpsc};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use crate::raft::{
-    CommandRequest, LogEntry, LogRequest, LogResponse, MessageData, NodeID, Role, VoteRequest,
-    VoteResponse, RoleTransition, Message,
+    CommandRequest, LogEntry, LogRequest, LogResponse, Message, MessageData, NodeID, Role,
+    RoleTransition, VoteRequest, VoteResponse,
 };
 use crate::state::Storage;
-use crate::utils::get_time_ms;
+use crate::utils;
 
 // should be long, allow time for elections to reach all nodes
-const ELECTION_TIMEOUT_MS: std::ops::RangeInclusive<u128> = 1000..=2500;
+const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> = Duration::from_millis(1000)..=Duration::from_millis(2500);
 
 // should be very low, need establish authority and stop other elections
-const HEARTBEAT_INTERVAL_MS: u128 = 50;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+
+// ms to wait for an incoming message before assuming none.
+// helps to reduce CPU usage by slowing down event loop.
+const GET_MESSAGE_WAIT: u64 = 1;
 
 pub struct NewNode<S: Storage> {
     pub node: Node<S>,
-    pub sender: SyncSender<Message>,
+    pub sender: Sender<Message>,
     pub receiver: Receiver<Message>,
 }
 
@@ -38,25 +41,25 @@ pub struct Node<S: Storage> {
     sent_length: HashMap<NodeID, usize>,
     acked_length: HashMap<NodeID, usize>,
 
-    // implementation details
+    // implementation
     forwarding_queue: VecDeque<CommandRequest>,
-    t_heartbeat_received: u128,
-    t_heartbeat_sent: u128,
-    election_timeout: u128,
-    t_election_start: u128,
+    t_heartbeat_received: Instant,
+    t_heartbeat_sent: Instant,
+    election_timeout: Duration,
+    t_election_start: Instant,
     receiver: Receiver<Message>,
-    transport: SyncSender<Message>, 
+    transport: Sender<Message>,
     nodes: HashSet<NodeID>,
     state: S,
 }
 
 impl<S: Storage> Node<S> {
-    pub fn new(id: usize, nodes: HashSet<NodeID>, state: S) -> NewNode<S> {
+    pub fn new_node(id: usize, nodes: HashSet<NodeID>, state: S) -> NewNode<S> {
         // sender is used to send messages to the node from the transport
-        let (sender, rx) = mpsc::sync_channel(100_000);
+        let (sender, rx) = mpsc::channel();
 
         // receiver is used to receive messages outside the node in the transport
-        let (tx, receiver) = mpsc::sync_channel(100_000);
+        let (tx, receiver) = mpsc::channel();
         log::info!("[Node {}] Initializing...", id);
         let node = Node {
             id,
@@ -73,10 +76,10 @@ impl<S: Storage> Node<S> {
 
             // implementation details
             forwarding_queue: VecDeque::new(),
-            t_heartbeat_received: get_time_ms(),
-            t_heartbeat_sent: 0, // 0?
-            election_timeout: rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS), // 0? since we set on become follower
-            t_election_start: 0,                                                 // 0?
+            t_heartbeat_received: Instant::now(),
+            t_heartbeat_sent: Instant::now(), // 0?
+            election_timeout: utils::rand_duration(ELECTION_TIMEOUT), // 0? since we set on become follower
+            t_election_start: Instant::now(),                                                 // 0?
             // incoming messages
             receiver: rx,
             // outgoing messages
@@ -127,7 +130,7 @@ impl<S: Storage> Node<S> {
         self.try_send_fifo();
 
         // check for heartbeat timeout
-        if get_time_ms() > self.t_heartbeat_received + self.election_timeout {
+        if Instant::now() > self.t_heartbeat_received + self.election_timeout {
             log::warn!("{} has not received heartbeat, becoming candidate", self.dbg());
             return Some(RoleTransition::Candidate);
         }
@@ -137,7 +140,7 @@ impl<S: Storage> Node<S> {
 
     fn candidate(&mut self) -> Option<RoleTransition> {
         // check for election timeout
-        if get_time_ms() > self.t_election_start + self.election_timeout {
+        if Instant::now() > self.t_election_start + self.election_timeout {
             log::warn!("{} election timeout reached, restarting election", self.dbg());
             return Some(RoleTransition::Candidate);
         }
@@ -146,7 +149,7 @@ impl<S: Storage> Node<S> {
     }
 
     fn leader(&mut self) -> Option<RoleTransition> {
-        if get_time_ms() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL_MS {
+        if Instant::now() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL {
             log::trace!("{} heartbeat timeout, sending heartbeat", self.dbg());
             self.send_heartbeat();
         }
@@ -157,7 +160,7 @@ impl<S: Storage> Node<S> {
     fn become_follower(&mut self, term: usize) {
         self.current_role = Role::Follower;
         self.current_term = term;
-        self.election_timeout = rand::thread_rng().gen_range(ELECTION_TIMEOUT_MS);
+        self.election_timeout = utils::rand_duration(ELECTION_TIMEOUT);
     }
 
     fn become_candidate(&mut self) {
@@ -166,7 +169,7 @@ impl<S: Storage> Node<S> {
         self.current_term += 1;
         self.votes_received.clear();
         self.votes_received.insert(self.id);
-        self.t_election_start = get_time_ms();
+        self.t_election_start = Instant::now();
 
         self.request_votes();
     }
@@ -271,7 +274,7 @@ impl<S: Storage> Node<S> {
         // if we voted yes, we should NOT be resetting vote here but we do
         if should_become_follower {
             // we already fixed term above
-            return Some(RoleTransition::Follower{term: self.current_term});
+            return Some(RoleTransition::Follower { term: self.current_term });
         }
 
         None
@@ -289,7 +292,7 @@ impl<S: Storage> Node<S> {
                 self.current_term
             );
             self.voted_for = None; // must reset our vote, since it was for an old term
-            return Some(RoleTransition::Follower{term: response.term});
+            return Some(RoleTransition::Follower { term: response.term });
         }
 
         if self.current_role == Role::Candidate
@@ -344,7 +347,7 @@ impl<S: Storage> Node<S> {
     }
 
     fn send_heartbeat(&mut self) {
-        self.t_heartbeat_sent = get_time_ms();
+        self.t_heartbeat_sent = Instant::now();
         for follower in &self.nodes {
             if *follower != self.id {
                 self.replicate_log(follower);
@@ -381,7 +384,7 @@ impl<S: Storage> Node<S> {
     fn receive_log_request(&mut self, request: LogRequest) -> Option<RoleTransition> {
         let mut should_become_follower = false;
 
-        self.t_heartbeat_received = get_time_ms();
+        self.t_heartbeat_received = Instant::now();
 
         if request.term > self.current_term {
             self.current_term = request.term;
@@ -443,7 +446,7 @@ impl<S: Storage> Node<S> {
 
         if should_become_follower {
             // self.current_term already updated above
-            return Some(RoleTransition::Follower{term: self.current_term});
+            return Some(RoleTransition::Follower { term: self.current_term });
         }
 
         None
@@ -486,11 +489,11 @@ impl<S: Storage> Node<S> {
     fn receive_log_response(&mut self, response: LogResponse) -> Option<RoleTransition> {
         if response.term > self.current_term {
             // as usual, step down if we see higher term
-            self.t_heartbeat_received = get_time_ms();
+            self.t_heartbeat_received = Instant::now();
             self.voted_for = None;
-            return Some(RoleTransition::Follower{term: response.term});
-        } 
-        
+            return Some(RoleTransition::Follower { term: response.term });
+        }
+
         if response.term == self.current_term && self.current_role == Role::Leader {
             // ensures ack > last ack, incase response re-ordered
             if response.success && response.ack >= self.acked_length[&response.sender] {
@@ -513,7 +516,7 @@ impl<S: Storage> Node<S> {
                 *self.sent_length.get_mut(&response.sender).unwrap() -= 1;
                 self.replicate_log(&response.sender);
             }
-        } 
+        }
 
         None
     }
@@ -547,9 +550,11 @@ impl<S: Storage> Node<S> {
     }
 
     fn get_next_message(&self) -> Option<MessageData> {
-        if let Some(Message { destination: _, message }) = self.receiver.try_recv().ok() {
+        if let Ok(Message { destination: _, message }) =
+            self.receiver.recv_timeout(Duration::from_millis(GET_MESSAGE_WAIT))
+        {
             return Some(message);
-        } 
+        }
 
         None
     }
@@ -563,7 +568,11 @@ impl<S: Storage> Node<S> {
     fn try_send_fifo(&mut self) {
         if let Some(leader) = self.current_leader {
             for command in self.forwarding_queue.drain(..) {
-                self.transport.send(Message { destination: leader, message: MessageData::CommandRequest(command) })
+                self.transport
+                    .send(Message {
+                        destination: leader,
+                        message: MessageData::CommandRequest(command),
+                    })
                     .unwrap();
             }
         }
@@ -577,7 +586,7 @@ impl<S: Storage> Node<S> {
             Some(MessageData::LogRequest(log_req)) => self.receive_log_request(log_req),
             Some(MessageData::LogResponse(log_resp)) => self.receive_log_response(log_resp),
             None => None,
-        } 
+        }
     }
 
     #[inline]

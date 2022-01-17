@@ -1,4 +1,4 @@
-use crate::raft::{CommandRequest, MessageData, NodeID, Message};
+use crate::raft::Message;
 
 pub mod channel_mock_transport;
 

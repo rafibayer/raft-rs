@@ -12,43 +12,45 @@ mod server;
 #[cfg(test)]
 mod test;
 
-use std::{thread, time::Duration, sync::{Arc}, collections::{HashSet, HashMap}};
+use std::{thread, time::Duration, collections::{HashSet, HashMap}};
 
-use rand::Rng;
 use simple_logger::SimpleLogger;
 
 use node::Node;
-use raft::{Message, CommandRequest};
-use transport::{Transport, channel_mock_transport::{ChannelMockTransport, NodeChannel}};
+use transport::{channel_mock_transport::{ChannelMockTransport, NodeChannel}};
 
 fn main() {
 
     SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
-    let n = 5;
+    let n = 11;
 
-
-    let mut nodes = Vec::new();
+    // collection of nodes and corresponding channels
+    let mut new_nodes = Vec::new();
 
     let node_set = HashSet::from_iter(0..n);
 
     for i in 0..n {
-        nodes.push(Node::new(i, node_set.clone(), HashMap::new()));
+        new_nodes.push(Node::new_node(i, node_set.clone(), HashMap::new()));
     }
 
+    let mut nodes = Vec::new();
     let mut node_channels = HashMap::new();
-    for mut node in nodes {
-        
-        node_channels.insert(node.node.id, NodeChannel {
-            sender: node.sender,
-            receiver: node.receiver,
+    for new_node in new_nodes {
+        node_channels.insert(new_node.node.id, NodeChannel {
+            sender: new_node.sender,
+            receiver: new_node.receiver,
         });
 
-        thread::spawn(move || node.node.start());
+        nodes.push(new_node.node);
     }
 
     let transport = ChannelMockTransport::new(0..=0, node_channels);
-    thread::spawn(move|| {
+    thread::spawn(move || {
         transport.start();
+    });
+
+    nodes.into_iter().for_each(|mut node| {
+        thread::spawn(move || node.start());
     });
 
     thread::sleep(Duration::from_secs(10));

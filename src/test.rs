@@ -1,9 +1,8 @@
-use std::{sync::{Arc}, collections::{HashMap, HashSet}, thread, time::Duration};
+use std::{collections::{HashMap, HashSet}, thread, time::Duration};
 
-use rand::Rng;
 use simple_logger::SimpleLogger;
 
-use crate::{transport::{channel_mock_transport::{ChannelMockTransport, NodeChannel}}, node::Node, raft::{CommandRequest}};
+use crate::{transport::{channel_mock_transport::{ChannelMockTransport, NodeChannel}}, node::Node};
 
 
 #[test]

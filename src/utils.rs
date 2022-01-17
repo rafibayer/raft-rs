@@ -1,9 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
+use std::time::Duration;
 
+use rand::Rng;
 
-pub fn get_time_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
+pub fn rand_duration(range: std::ops::RangeInclusive<Duration>) -> Duration {
+    rand::thread_rng().gen_range(range)
 }
