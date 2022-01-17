@@ -12,22 +12,20 @@ mod transport;
 mod test;
 
 use std::{thread, time::Duration, sync::{Arc}, collections::{HashSet, HashMap}};
-use parking_lot::Mutex;
 
 use rand::Rng;
 use simple_logger::SimpleLogger;
 
 use node::Node;
-use raft::{NetworkMessage, CommandRequest, NodeID};
+use raft::{NetworkMessage, CommandRequest};
 use transport::{Transport, ChannelMockTransport};
-
 
 fn main() {
 
     SimpleLogger::new().without_timestamps().init().unwrap();
-    let n = 9;
+    let n = 3;
 
-    let mut transport = ChannelMockTransport::new(0..=0);
+    let mut transport = ChannelMockTransport::new(10..=50);
 
     let mut nodes = Vec::new();
 
@@ -58,5 +56,5 @@ fn main() {
             CommandRequest{command: format!("SET X {}", i)}));
     }
 
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(25));
 }

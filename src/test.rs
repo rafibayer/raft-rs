@@ -1,19 +1,20 @@
-use std::{sync::{Arc}, collections::{HashMap, HashSet}, thread};
+use std::{sync::{Arc}, collections::{HashMap, HashSet}, thread, time::Duration};
 use parking_lot::Mutex;
 
+use rand::Rng;
 use simple_logger::SimpleLogger;
 
-use crate::{transport::{ChannelMockTransport}, node::Node};
+use crate::{transport::{ChannelMockTransport, Transport}, node::Node, raft::{NetworkMessage, CommandRequest}};
 
 
 
 
 #[test]
 fn test_startup() {
-    SimpleLogger::new().init().unwrap();
-    let n = 3;
+    SimpleLogger::new().without_timestamps().init().unwrap();
+    let n = 15;
 
-    let mut transport = ChannelMockTransport::new(0..=0);
+    let mut transport = ChannelMockTransport::new(10..=50);
 
     let mut nodes = Vec::new();
 
@@ -35,4 +36,14 @@ fn test_startup() {
         let arc_transport_clone = arc_transport.clone();
         thread::spawn(move || node.start(arc_transport_clone));
     }
+   
+    thread::sleep(Duration::from_secs(10));
+
+    for i in 0..25 {
+        let tgt = rand::thread_rng().gen_range(0..n);
+        arc_transport.send(tgt, NetworkMessage::CommandRequest(
+            CommandRequest{command: format!("SET X {}", i)}));
+    }
+
+    thread::sleep(Duration::from_secs(25));
 }

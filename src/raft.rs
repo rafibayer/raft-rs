@@ -7,6 +7,13 @@ pub enum Role {
     Leader
 }
 
+#[derive(PartialEq, Eq, Debug)]
+pub enum RoleTransition {
+    Follower{term: usize},
+    Candidate,
+    Leader
+}
+
 #[derive(Clone, Debug)]
 pub struct LogEntry {
     pub command: String,
