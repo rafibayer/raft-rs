@@ -5,21 +5,18 @@ pub trait Storage: Sync + Send {
 }
 
 impl Storage for HashMap<String, String> {
-    
-    //! Command formats: 
+    //! Command formats:
     //!     GET <KEY>
     //!     SET <KEY> <VALUE>
     fn apply_command(&mut self, command: &str) -> Result<String, String> {
         let parts = command.splitn(3, " ").collect::<Vec<&str>>();
         match parts.len() {
-            2 => {
-                self.get(parts[1]).cloned().ok_or(String::from("KEY NOT FOUND"))
-            },
+            2 => self.get(parts[1]).cloned().ok_or(String::from("KEY NOT FOUND")),
             3 => {
                 self.insert(parts[1].to_string(), parts[2].to_string());
                 Ok(String::new())
-            },
-            _ => Err("Malformed Command".to_string())
+            }
+            _ => Err("Malformed Command".to_string()),
         }
     }
 }
@@ -39,5 +36,4 @@ mod test {
         assert_eq!(true, state.apply_command("SET Y 3").is_ok());
         assert_eq!(true, state.apply_command("GET Y") == Ok("3".to_string()));
     }
-
 }

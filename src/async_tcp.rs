@@ -1,8 +1,12 @@
-use std::{net::{TcpStream, TcpListener, SocketAddr}, thread, sync::mpsc::{Sender, Receiver}, io::{Read, Write}, collections::HashMap};
+use std::{
+    collections::HashMap,
+    io::{Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::mpsc::{Receiver, Sender},
+    thread,
+};
 
-use log::info;
-
-use crate::raft::{RaftRequest, NodeID};
+use crate::raft::{NodeID, RaftRequest};
 
 pub fn incoming_listener(address: SocketAddr, incoming: Sender<RaftRequest>) {
     let listener = TcpListener::bind(address).unwrap();
@@ -17,7 +21,7 @@ pub fn incoming_listener(address: SocketAddr, incoming: Sender<RaftRequest>) {
     log::error!("listener thread terminating!!!");
 }
 
-fn handle_connection(mut stream: TcpStream,incoming: Sender<RaftRequest>) {
+fn handle_connection(mut stream: TcpStream, incoming: Sender<RaftRequest>) {
     loop {
         let mut size_buf = [0; 8];
         stream.read_exact(&mut size_buf).unwrap();
@@ -31,11 +35,16 @@ fn handle_connection(mut stream: TcpStream,incoming: Sender<RaftRequest>) {
     }
 }
 
-pub fn outgoing_pusher(id: NodeID, outgoing: Receiver<(RaftRequest, NodeID)>, nodes: HashMap<NodeID, SocketAddr>) {
-    let connections = nodes.into_iter().map(|(node, addr)| {
-        (node, TcpStream::connect(addr).unwrap())
-    }).collect::<HashMap<NodeID, TcpStream>>();
-    
+pub fn outgoing_pusher(
+    id: NodeID,
+    outgoing: Receiver<(RaftRequest, NodeID)>,
+    nodes: HashMap<NodeID, SocketAddr>,
+) {
+    let connections = nodes
+        .into_iter()
+        .map(|(node, addr)| (node, TcpStream::connect(addr).unwrap()))
+        .collect::<HashMap<NodeID, TcpStream>>();
+
     for (req, node) in outgoing.into_iter() {
         assert_ne!(node, id);
 

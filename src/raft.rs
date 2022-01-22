@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 pub type NodeID = usize;
 
@@ -6,7 +6,7 @@ pub type NodeID = usize;
 pub enum Role {
     Follower,
     Candidate,
-    Leader
+    Leader,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -60,12 +60,12 @@ pub struct VoteRequest {
     pub sender: NodeID,
     pub term: usize,
     pub log_length: usize,
-    pub last_log_term: usize
+    pub last_log_term: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct VoteResponse {
     pub sender: NodeID,
     pub term: usize,
-    pub granted: bool
+    pub granted: bool,
 }

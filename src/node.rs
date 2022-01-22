@@ -1,21 +1,18 @@
 use std::cmp::min;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, self, Write, Error};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::{thread, error};
 use std::time::{Duration, Instant};
+use std::{error, thread};
 
 use crate::async_tcp::{incoming_listener, outgoing_pusher};
 use crate::raft::{
-    CommandRequest, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role, VoteRequest,
-    VoteResponse, CommandResponse,
+    CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
+    VoteRequest, VoteResponse,
 };
 use crate::state::Storage;
 use crate::utils;
-
-use bincode;
-use log::info;
 
 // should be long, allow time for elections to reach all nodes
 const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
@@ -133,7 +130,8 @@ impl<S: Storage> Node<S> {
     fn candidate(&mut self) {
         // check for election timeout
         if Instant::now() > self.t_election_start + self.election_timeout {
-            log::warn!("{} election timeout reached \n\t(start: {:?}, now: {:?}), \n\trestarting election",
+            log::warn!(
+                "{} election timeout reached \n\t(start: {:?}, now: {:?}), \n\trestarting election",
                 self.stamp(),
                 self.t_election_start,
                 Instant::now(),
@@ -281,10 +279,11 @@ impl<S: Storage> Node<S> {
 
             todo!()
             // return ...
-            
-        } 
+        }
 
-        self.outgoing.send((RaftRequest::CommandRequest(message), self.current_leader.unwrap())).unwrap();
+        self.outgoing
+            .send((RaftRequest::CommandRequest(message), self.current_leader.unwrap()))
+            .unwrap();
         todo!() // todo
     }
 
@@ -456,7 +455,7 @@ impl<S: Storage> Node<S> {
     }
 
     fn get_next_request(&self) -> Option<RaftRequest> {
-       self.incoming.try_recv().ok()
+        self.incoming.try_recv().ok()
     }
 
     fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
@@ -466,40 +465,36 @@ impl<S: Storage> Node<S> {
                     let from = request.sender;
                     let response = RaftRequest::CommandResponse(self.broadcast_request(request));
                     self.outgoing.send((response, from))?;
-                },
+                }
                 RaftRequest::CommandResponse(_response) => {
                     todo!()
-                },
+                }
                 RaftRequest::LogRequest(request) => {
                     let from = request.sender;
                     let response = RaftRequest::LogResponse(self.receive_log_request(request));
                     self.outgoing.send((response, from))?;
-                },
+                }
                 RaftRequest::LogResponse(response) => {
                     self.receive_log_response(response);
-                },
+                }
                 RaftRequest::VoteRequest(request) => {
                     let from = request.sender;
 
                     let response = RaftRequest::VoteResponse(self.receive_vote_request(request));
                     self.outgoing.send((response, from))?;
-                },
+                }
                 RaftRequest::VoteResponse(response) => {
                     self.receive_vote_response(response);
-                },
+                }
             }
-        } 
+        }
 
         Ok(())
     }
-   
+
     #[inline]
     fn followers(&self) -> Vec<NodeID> {
-        self.nodes
-            .keys()
-            .map(|k| *k)
-            .filter(|k| *k != self.id)
-            .collect()
+        self.nodes.keys().map(|k| *k).filter(|k| *k != self.id).collect()
     }
 
     #[inline]
