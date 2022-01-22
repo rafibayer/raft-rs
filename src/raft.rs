@@ -1,3 +1,5 @@
+use serde::{Serialize, Deserialize};
+
 pub type NodeID = usize;
 
 #[derive(PartialEq, Eq, Debug)]
@@ -7,45 +9,37 @@ pub enum Role {
     Leader
 }
 
-#[derive(PartialEq, Eq, Debug)]
-pub enum RoleTransition {
-    Follower{term: usize},
-    Candidate,
-    Leader
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogEntry {
     pub command: String,
     pub term: usize,
 }
 
-#[derive(Debug)]
-pub struct CommandRequest {
-    pub command: String,
-}
-
-#[derive(Debug)]
-pub struct Message {
-    pub destination: NodeID,
-    pub message: MessageData
-}
-
-#[derive(Debug)]
-pub enum MessageData {
-    // client requests
+#[derive(Debug, Serialize, Deserialize)]
+pub enum RaftRequest {
     CommandRequest(CommandRequest),
-
-    // internal
+    CommandResponse(CommandResponse),
     LogRequest(LogRequest),
     LogResponse(LogResponse),
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandRequest {
+    pub sender: NodeID, // needed?
+    pub command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CommandResponse {
+    pub sender: Option<NodeID>, // needed?
+    pub reply: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LogRequest {
-    pub leader_id: NodeID,
+    pub sender: NodeID,
     pub term: usize,
     pub prefix_lenth: usize,
     pub prefix_term: usize,
@@ -53,7 +47,7 @@ pub struct LogRequest {
     pub suffix: Vec<LogEntry>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LogResponse {
     pub sender: NodeID,
     pub term: usize,
@@ -61,7 +55,7 @@ pub struct LogResponse {
     pub success: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VoteRequest {
     pub sender: NodeID,
     pub term: usize,
@@ -69,13 +63,9 @@ pub struct VoteRequest {
     pub last_log_term: usize
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VoteResponse {
-    pub voter: NodeID,
+    pub sender: NodeID,
     pub term: usize,
     pub granted: bool
 }
-
-
-
-

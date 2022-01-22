@@ -1,30 +1,32 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{Read, self, Write, Error};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::{thread, error};
 use std::time::{Duration, Instant};
 
+use crate::async_tcp::{incoming_listener, outgoing_pusher};
 use crate::raft::{
-    CommandRequest, LogEntry, LogRequest, LogResponse, Message, MessageData, NodeID, Role,
-    RoleTransition, VoteRequest, VoteResponse,
+    CommandRequest, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role, VoteRequest,
+    VoteResponse, CommandResponse,
 };
 use crate::state::Storage;
 use crate::utils;
 
+use bincode;
+use log::info;
+
 // should be long, allow time for elections to reach all nodes
-const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> = Duration::from_millis(1000)..=Duration::from_millis(2500);
+const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
+    Duration::from_millis(1000)..=Duration::from_millis(2500);
 
 // should be very low, need establish authority and stop other elections
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1);
 
 // ms to wait for an incoming message before assuming none.
 // helps to reduce CPU usage by slowing down event loop.
 const GET_MESSAGE_WAIT: u64 = 1;
-
-pub struct NewNode<S: Storage> {
-    pub node: Node<S>,
-    pub sender: Sender<Message>,
-    pub receiver: Receiver<Message>,
-}
 
 pub struct Node<S: Storage> {
     // stable
@@ -42,26 +44,42 @@ pub struct Node<S: Storage> {
     acked_length: HashMap<NodeID, usize>,
 
     // implementation
-    forwarding_queue: VecDeque<CommandRequest>,
     t_heartbeat_received: Instant,
     t_heartbeat_sent: Instant,
     election_timeout: Duration,
     t_election_start: Instant,
-    receiver: Receiver<Message>,
-    transport: Sender<Message>,
-    nodes: HashSet<NodeID>,
+    nodes: HashMap<NodeID, SocketAddr>,
+
+    // outgoing requests and responses
+    outgoing: Sender<(RaftRequest, NodeID)>,
+
+    // incoming requests and responses
+    incoming: Receiver<RaftRequest>,
+
     state: S,
 }
 
 impl<S: Storage> Node<S> {
-    pub fn new_node(id: usize, nodes: HashSet<NodeID>, state: S) -> NewNode<S> {
-        // sender is used to send messages to the node from the transport
-        let (sender, rx) = mpsc::channel();
+    pub fn new(id: usize, nodes: HashMap<NodeID, SocketAddr>, state: S) -> Self {
+        let (tx_outgoing, rx_outgoing) = mpsc::channel();
+        let (tx_incoming, rx_incoming) = mpsc::channel();
 
-        // receiver is used to receive messages outside the node in the transport
-        let (tx, receiver) = mpsc::channel();
+        let address = nodes[&id];
+        thread::spawn(move || {
+            // will send incoming requests to tx_incoming.
+            // node will get them from incoming: rx_incoming
+            incoming_listener(address, tx_incoming);
+        });
+
+        let node_clone = nodes.clone();
+        thread::spawn(move || {
+            // will receive outgoing requests from rx_outgoing.
+            // node will send them from tx_outgoing
+            outgoing_pusher(id, rx_outgoing, node_clone);
+        });
+
         log::info!("[Node {}] Initializing...", id);
-        let node = Node {
+        Node {
             id,
             current_term: 0,
             voted_for: None,
@@ -75,20 +93,16 @@ impl<S: Storage> Node<S> {
             acked_length: HashMap::new(),
 
             // implementation details
-            forwarding_queue: VecDeque::new(),
             t_heartbeat_received: Instant::now(),
             t_heartbeat_sent: Instant::now(), // 0?
             election_timeout: utils::rand_duration(ELECTION_TIMEOUT), // 0? since we set on become follower
-            t_election_start: Instant::now(),                                                 // 0?
-            // incoming messages
-            receiver: rx,
-            // outgoing messages
-            transport: tx,
+            t_election_start: Instant::now(),
             nodes,
-            state,
-        };
+            outgoing: tx_outgoing,
+            incoming: rx_incoming,
 
-        NewNode { node, sender, receiver }
+            state,
+        }
     }
 
     pub fn start(&mut self) {
@@ -98,63 +112,40 @@ impl<S: Storage> Node<S> {
 
     fn event_loop(&mut self) -> ! {
         loop {
-            // process messages and check for transitions
-            // todo: optimistic message processing? if the queue is long, can we process a few messages before moving to role specific stuff?
-            let next_role = if let Some(transition) = self.process_next_message() {
-                Some(transition)
-            // perform role if we haven't transitioned due to a message
-            } else {
-                match self.current_role {
-                    Role::Follower => self.follower(),
-                    Role::Candidate => self.candidate(),
-                    Role::Leader => self.leader(),
-                }
-            };
+            self.process_message().unwrap();
 
-            // transition if needed.
-            // we process transitions even to the same role, because this could represent
-            // incrementing follwer term when stepping down, or restarting an election.
-            if let Some(transition) = next_role {
-                // log::warn!("{} transitioning to {:?}", self.dbg(), transition);
-                match transition {
-                    RoleTransition::Follower { term } => self.become_follower(term),
-                    RoleTransition::Candidate => self.become_candidate(),
-                    RoleTransition::Leader => self.become_leader(),
-                };
-            }
+            match self.current_role {
+                Role::Follower => self.follower(),
+                Role::Candidate => self.candidate(),
+                Role::Leader => self.leader(),
+            };
         }
     }
 
-    fn follower(&mut self) -> Option<RoleTransition> {
-        // should this go here or event_loop?
-        self.try_send_fifo();
-
+    fn follower(&mut self) {
         // check for heartbeat timeout
         if Instant::now() > self.t_heartbeat_received + self.election_timeout {
-            log::warn!("{} has not received heartbeat, becoming candidate", self.stamp());
-            return Some(RoleTransition::Candidate);
+            log::warn!("{} has not received heartbeat since \n\t(last: {:?}, now: {:?}), \n\tbecoming candidate", self.stamp(), self.t_heartbeat_received, Instant::now());
+            self.become_candidate();
         }
-
-        None
     }
 
-    fn candidate(&mut self) -> Option<RoleTransition> {
+    fn candidate(&mut self) {
         // check for election timeout
         if Instant::now() > self.t_election_start + self.election_timeout {
-            log::warn!("{} election timeout reached, restarting election", self.stamp());
-            return Some(RoleTransition::Candidate);
+            log::warn!("{} election timeout reached \n\t(start: {:?}, now: {:?}), \n\trestarting election",
+                self.stamp(),
+                self.t_election_start,
+                Instant::now(),
+            );
+            self.become_candidate();
         }
-
-        None
     }
 
-    fn leader(&mut self) -> Option<RoleTransition> {
+    fn leader(&mut self) {
         if Instant::now() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL {
-            log::trace!("{} heartbeat timeout, sending heartbeat", self.stamp());
             self.send_heartbeat();
         }
-
-        None
     }
 
     fn become_follower(&mut self, term: usize) {
@@ -179,12 +170,10 @@ impl<S: Storage> Node<S> {
         self.current_leader = Some(self.id);
 
         // replicate logs to other nodes
-        for follower in &self.nodes {
-            if *follower != self.id {
-                self.sent_length.insert(*follower, self.log.len());
-                self.acked_length.insert(*follower, 0);
-                self.replicate_log(follower);
-            }
+        for follower in self.followers() {
+            self.sent_length.insert(follower, self.log.len());
+            self.acked_length.insert(follower, 0);
+            self.replicate_log(follower);
         }
     }
 
@@ -194,23 +183,21 @@ impl<S: Storage> Node<S> {
             last_term = self.log[self.log.len() - 1].term;
         }
 
-        for node in &self.nodes {
-            if *node != self.id {
-                let request = VoteRequest {
-                    sender: self.id,
-                    term: self.current_term,
-                    log_length: self.log.len(),
-                    last_log_term: last_term,
-                };
-                self.send_message(*node, MessageData::VoteRequest(request));
-            }
+        for follower in self.followers() {
+            let request = VoteRequest {
+                sender: self.id,
+                term: self.current_term,
+                log_length: self.log.len(),
+                last_log_term: last_term,
+            };
+
+            log::trace!("{} sending vote request to {}", self.stamp(), follower);
+            self.outgoing.send((RaftRequest::VoteRequest(request), follower)).unwrap();
         }
     }
 
-    fn receive_vote_request(&mut self, request: VoteRequest) -> Option<RoleTransition> {
+    fn receive_vote_request(&mut self, request: VoteRequest) -> VoteResponse {
         log::trace!("{} received vote request from Node {}", self.stamp(), request.sender);
-
-        let mut should_become_follower = false;
 
         // if we see a higher term, step down
         if request.term > self.current_term {
@@ -221,10 +208,8 @@ impl<S: Storage> Node<S> {
                 request.sender,
                 request.term
             );
-            // have to set term here since it is used in request validation
-            self.current_term = request.term;
             self.voted_for = None; // must reset our vote, since it was for an old term
-            should_become_follower = true;
+            self.become_follower(request.term);
         }
 
         let mut last_term = 0;
@@ -238,50 +223,17 @@ impl<S: Storage> Node<S> {
 
         // if the requestors term is current, log is healthy, and we haven't voted yet, vote yes
         if request.term == self.current_term && log_ok && self.voted_for == None {
-            log::trace!("{} voting for Node {}", self.stamp(), request.sender);
-
+            log::info!("{} voting for Node {}", self.stamp(), request.sender);
             self.voted_for = Some(request.sender);
-            self.send_message(
-                request.sender,
-                MessageData::VoteResponse(VoteResponse {
-                    voter: self.id,
-                    term: self.current_term,
-                    granted: true,
-                }),
-            );
-        } else {
-            log::warn!(
-                "{} will not vote for Node {}
-                request.term = {}, current_term = {}, log_ok = {}, vote_for = {:?}",
-                self.stamp(),
-                request.sender,
-                request.term,
-                self.current_term,
-                log_ok,
-                self.voted_for
-            );
 
-            self.send_message(
-                request.sender,
-                MessageData::VoteResponse(VoteResponse {
-                    voter: self.id,
-                    term: self.current_term,
-                    granted: false,
-                }),
-            );
+            return VoteResponse { sender: self.id, term: self.current_term, granted: true };
         }
 
-        // if we voted yes, we should NOT be resetting vote here but we do
-        if should_become_follower {
-            // we already fixed term above
-            return Some(RoleTransition::Follower { term: self.current_term });
-        }
-
-        None
+        VoteResponse { sender: self.id, term: self.current_term, granted: false }
     }
 
-    fn receive_vote_response(&mut self, response: VoteResponse) -> Option<RoleTransition> {
-        log::trace!("{} received vote response from Node {}", self.stamp(), response.voter);
+    fn receive_vote_response(&mut self, response: VoteResponse) {
+        log::trace!("{} received vote response from Node {}", self.stamp(), response.sender);
 
         // check for higher term on vote response;
         if response.term > self.current_term {
@@ -292,16 +244,16 @@ impl<S: Storage> Node<S> {
                 self.current_term
             );
             self.voted_for = None; // must reset our vote, since it was for an old term
-            return Some(RoleTransition::Follower { term: response.term });
+            self.become_follower(response.term);
         }
 
         if self.current_role == Role::Candidate
             && response.term == self.current_term
             && response.granted
         {
-            log::trace!("{} received granted vote from {}", self.stamp(), response.voter);
+            log::info!("{} received granted vote from {}", self.stamp(), response.sender);
 
-            self.votes_received.insert(response.voter);
+            self.votes_received.insert(response.sender);
 
             // check for quorum
             if self.votes_received.len() >= (self.nodes.len() / 2) + 1 {
@@ -311,53 +263,42 @@ impl<S: Storage> Node<S> {
                     self.votes_received.len()
                 );
 
-                // replicate log, assume leader role
-                for follower in &self.nodes {
-                    if *follower != self.id {
-                        self.sent_length.insert(*follower, self.log.len());
-                        self.acked_length.insert(*follower, 0);
-                        self.replicate_log(follower);
-                    }
-                }
-
-                return Some(RoleTransition::Leader);
+                self.become_leader()
             }
         }
-
-        None
     }
 
-    fn broadcast_request(&mut self, message: CommandRequest) -> Option<RoleTransition> {
+    // todo: uh-oh, how is this gonna work?
+    fn broadcast_request(&mut self, message: CommandRequest) -> CommandResponse {
         if self.current_role == Role::Leader {
             log::trace!("{} received broadcast request as leader", self.stamp());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
-            for follower in &self.nodes {
-                if *follower != self.id {
-                    self.replicate_log(follower);
-                }
+            for follower in self.followers() {
+                self.replicate_log(follower);
             }
-        } else {
-            log::trace!("{} received broadcast request as follower, forwarding.", self.stamp());
-            self.forward(message);
-        }
 
-        None
+            todo!()
+            // return ...
+            
+        } 
+
+        self.outgoing.send((RaftRequest::CommandRequest(message), self.current_leader.unwrap())).unwrap();
+        todo!() // todo
     }
 
     fn send_heartbeat(&mut self) {
         self.t_heartbeat_sent = Instant::now();
-        for follower in &self.nodes {
-            if *follower != self.id {
-                self.replicate_log(follower);
-            }
+
+        for follower in self.followers() {
+            self.replicate_log(follower);
         }
     }
 
-    fn replicate_log(&self, follower: &NodeID) {
+    fn replicate_log(&self, follower: NodeID) {
         // prefix: all log entries we think we have sent to follower
-        let prefix_len = self.sent_length[follower];
+        let prefix_len = self.sent_length[&follower];
 
         // suffix: all log entries we have not yet sent to the follower
         let suffix = &self.log[prefix_len..];
@@ -368,22 +309,19 @@ impl<S: Storage> Node<S> {
             prefix_term = self.log[prefix_len - 1].term;
         }
 
-        self.send_message(
-            *follower,
-            MessageData::LogRequest(LogRequest {
-                leader_id: self.id,
-                term: self.current_term,
-                prefix_lenth: prefix_len,
-                prefix_term,
-                leader_commit: self.commit_length,
-                suffix: suffix.to_vec(), // todo: expensive clone
-            }),
-        )
+        let request = LogRequest {
+            sender: self.id,
+            term: self.current_term,
+            prefix_lenth: prefix_len,
+            prefix_term,
+            leader_commit: self.commit_length,
+            suffix: suffix.to_vec(), // todo: expensive clone
+        };
+
+        self.outgoing.send((RaftRequest::LogRequest(request), follower)).unwrap();
     }
 
-    fn receive_log_request(&mut self, request: LogRequest) -> Option<RoleTransition> {
-        let mut should_become_follower = false;
-
+    fn receive_log_request(&mut self, request: LogRequest) -> LogResponse {
         self.t_heartbeat_received = Instant::now();
 
         if request.term > self.current_term {
@@ -395,9 +333,8 @@ impl<S: Storage> Node<S> {
         // fall through to this if-statement as well if
         // the first executed
         if request.term == self.current_term {
-            // instead of transitioning immediately, finish processing log first
-            should_become_follower = true;
-            self.current_leader = Some(request.leader_id);
+            self.become_follower(self.current_term);
+            self.current_leader = Some(request.sender);
         }
 
         // check that we have the prefix that the sender is assuming we have
@@ -422,34 +359,11 @@ impl<S: Storage> Node<S> {
             // if terms match and log is ok, append and ack success
             let ack = request.prefix_lenth + request.suffix.len();
             self.append_entries(request.prefix_lenth, request.leader_commit, request.suffix);
-            self.send_message(
-                request.leader_id,
-                MessageData::LogResponse(LogResponse {
-                    sender: self.id,
-                    term: self.current_term,
-                    ack,
-                    success: true,
-                }),
-            )
-        } else {
-            // otherwise ack error
-            self.send_message(
-                request.leader_id,
-                MessageData::LogResponse(LogResponse {
-                    sender: self.id,
-                    term: self.current_term,
-                    ack: 0,
-                    success: false,
-                }),
-            )
+
+            return LogResponse { sender: self.id, term: self.current_term, ack, success: true };
         }
 
-        if should_become_follower {
-            // self.current_term already updated above
-            return Some(RoleTransition::Follower { term: self.current_term });
-        }
-
-        None
+        LogResponse { sender: self.id, term: self.current_term, ack: 0, success: false }
     }
 
     fn append_entries(&mut self, prefix_len: usize, leader_commit: usize, suffix: Vec<LogEntry>) {
@@ -486,14 +400,7 @@ impl<S: Storage> Node<S> {
         }
     }
 
-    fn receive_log_response(&mut self, response: LogResponse) -> Option<RoleTransition> {
-        if response.term > self.current_term {
-            // as usual, step down if we see higher term
-            self.t_heartbeat_received = Instant::now();
-            self.voted_for = None;
-            return Some(RoleTransition::Follower { term: response.term });
-        }
-
+    fn receive_log_response(&mut self, response: LogResponse) {
         if response.term == self.current_term && self.current_role == Role::Leader {
             // ensures ack > last ack, incase response re-ordered
             if response.success && response.ack >= self.acked_length[&response.sender] {
@@ -514,18 +421,21 @@ impl<S: Storage> Node<S> {
                 // on next attempt.
                 // if gap is large, this could take many iterations. (can be optimized)
                 *self.sent_length.get_mut(&response.sender).unwrap() -= 1;
-                self.replicate_log(&response.sender);
+                self.replicate_log(response.sender);
             }
+        } else if response.term > self.current_term {
+            // as usual, step down if we see higher term
+            self.t_heartbeat_received = Instant::now();
+            self.voted_for = None;
+            self.become_follower(response.term);
         }
-
-        None
     }
 
     fn commit_log_entries(&mut self) {
         while self.commit_length < self.log.len() {
             // count acks
             let mut acks = 0;
-            for node in &self.nodes {
+            for node in self.nodes.keys() {
                 if self.acked_length[node] > self.commit_length {
                     acks += 1;
                 }
@@ -533,6 +443,7 @@ impl<S: Storage> Node<S> {
 
             // check for quorum
             if acks >= (self.nodes.len() / 2) + 1 {
+                log::info!("{} leader committing log {}", self.stamp(), self.commit_length);
                 self.state
                     .apply_command(&self.log[self.commit_length].command)
                     .expect("err applying command");
@@ -544,55 +455,51 @@ impl<S: Storage> Node<S> {
         }
     }
 
-    fn send_message(&self, node: NodeID, message: MessageData) {
-        log::trace!("{} sending message {:?} to Node {}", self.stamp(), message, node);
-        self.transport.send(Message { destination: node, message }).unwrap();
+    fn get_next_request(&self) -> Option<RaftRequest> {
+       self.incoming.try_recv().ok()
     }
 
-    fn get_next_message(&self) -> Option<MessageData> {
-        if let Ok(Message { destination: _, message }) =
-            self.receiver.recv_timeout(Duration::from_millis(GET_MESSAGE_WAIT))
-        {
-            return Some(message);
-        }
+    fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
+        if let Some(message) = self.get_next_request() {
+            match message {
+                RaftRequest::CommandRequest(request) => {
+                    let from = request.sender;
+                    let response = RaftRequest::CommandResponse(self.broadcast_request(request));
+                    self.outgoing.send((response, from))?;
+                },
+                RaftRequest::CommandResponse(_response) => {
+                    todo!()
+                },
+                RaftRequest::LogRequest(request) => {
+                    let from = request.sender;
+                    let response = RaftRequest::LogResponse(self.receive_log_request(request));
+                    self.outgoing.send((response, from))?;
+                },
+                RaftRequest::LogResponse(response) => {
+                    self.receive_log_response(response);
+                },
+                RaftRequest::VoteRequest(request) => {
+                    let from = request.sender;
 
-        None
-    }
-
-    fn forward(&mut self, message: CommandRequest) {
-        self.forwarding_queue.push_back(message);
-        self.try_send_fifo();
-    }
-
-    // forwards every message in the forwarding_queue if there is a current_leader
-    fn try_send_fifo(&mut self) {
-        if let Some(leader) = self.current_leader {
-            for command in self.forwarding_queue.drain(..) {
-                self.transport
-                    .send(Message {
-                        destination: leader,
-                        message: MessageData::CommandRequest(command),
-                    })
-                    .unwrap();
+                    let response = RaftRequest::VoteResponse(self.receive_vote_request(request));
+                    self.outgoing.send((response, from))?;
+                },
+                RaftRequest::VoteResponse(response) => {
+                    self.receive_vote_response(response);
+                },
             }
-        }
-    }
+        } 
 
-    // todo: optimistic message processing.
-    // we can perhaps get up to N messages from the channel and process them if no transition.
-    // must not pull message until after done with last so we don't lose messages in a transition.
-    // e.g. imagine processing results [None, None, Follower, ...].
-    // once we transition to follower, we still must process everything after, but if we've pulled it from the queue
-    // we probably need to return early to transition in the event_loop.
-    fn process_next_message(&mut self) -> Option<RoleTransition> {
-        match self.get_next_message() {
-            Some(MessageData::CommandRequest(command)) => self.broadcast_request(command),
-            Some(MessageData::VoteRequest(vote_req)) => self.receive_vote_request(vote_req),
-            Some(MessageData::VoteResponse(vote_resp)) => self.receive_vote_response(vote_resp),
-            Some(MessageData::LogRequest(log_req)) => self.receive_log_request(log_req),
-            Some(MessageData::LogResponse(log_resp)) => self.receive_log_response(log_resp),
-            None => None,
-        }
+        Ok(())
+    }
+   
+    #[inline]
+    fn followers(&self) -> Vec<NodeID> {
+        self.nodes
+            .keys()
+            .map(|k| *k)
+            .filter(|k| *k != self.id)
+            .collect()
     }
 
     #[inline]
