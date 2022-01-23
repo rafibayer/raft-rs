@@ -9,7 +9,7 @@ use std::{error, thread};
 use crate::async_tcp::{incoming_listener, outgoing_pusher};
 use crate::raft::{
     CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
-    VoteRequest, VoteResponse,
+    VoteRequest, VoteResponse, ReadRequest,
 };
 use crate::state::Storage;
 use crate::utils;
@@ -21,11 +21,10 @@ const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
 // should be very low, need establish authority and stop other elections
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1);
 
-// ms to wait for an incoming message before assuming none.
-// helps to reduce CPU usage by slowing down event loop.
-const GET_MESSAGE_WAIT: u64 = 1;
 
-pub struct Node<S: Storage> {
+pub type ClientConnection = Sender<CommandResponse>;
+
+pub struct Node<S: Storage<String, String>> {
     // stable
     pub id: NodeID,
     current_term: usize,
@@ -47,16 +46,18 @@ pub struct Node<S: Storage> {
     t_election_start: Instant,
     nodes: HashMap<NodeID, SocketAddr>,
 
+    waiting_clients: HashMap<usize, ClientConnection>,
+
     // outgoing requests and responses
     outgoing: Sender<(RaftRequest, NodeID)>,
 
     // incoming requests and responses
-    incoming: Receiver<RaftRequest>,
+    incoming: Receiver<(RaftRequest, Option<ClientConnection>)>,
 
     state: S,
 }
 
-impl<S: Storage> Node<S> {
+impl<S: Storage<String, String>> Node<S> {
     pub fn new(id: usize, nodes: HashMap<NodeID, SocketAddr>, state: S) -> Self {
         let (tx_outgoing, rx_outgoing) = mpsc::channel();
         let (tx_incoming, rx_incoming) = mpsc::channel();
@@ -95,6 +96,9 @@ impl<S: Storage> Node<S> {
             election_timeout: utils::rand_duration(ELECTION_TIMEOUT), // 0? since we set on become follower
             t_election_start: Instant::now(),
             nodes,
+
+            waiting_clients: HashMap::new(),
+
             outgoing: tx_outgoing,
             incoming: rx_incoming,
 
@@ -266,8 +270,7 @@ impl<S: Storage> Node<S> {
         }
     }
 
-    // todo: uh-oh, how is this gonna work?
-    fn broadcast_request(&mut self, message: CommandRequest) -> CommandResponse {
+    fn broadcast_request(&mut self, message: CommandRequest, client: ClientConnection) {
         if self.current_role == Role::Leader {
             log::trace!("{} received broadcast request as leader", self.stamp());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
@@ -277,14 +280,17 @@ impl<S: Storage> Node<S> {
                 self.replicate_log(follower);
             }
 
-            todo!()
-            // return ...
-        }
+            // once we commit this log, we must notify the client
+            self.waiting_clients.insert(self.log.len() - 1, client);
 
-        self.outgoing
-            .send((RaftRequest::CommandRequest(message), self.current_leader.unwrap()))
-            .unwrap();
-        todo!() // todo
+        } else {
+            // forward to leader or return Unavailable
+            let response = match self.current_leader {
+                Some(leader) => CommandResponse::NotLeader(leader),
+                None => CommandResponse::Unavailable,
+            };
+            client.send(response).unwrap();
+        }
     }
 
     fn send_heartbeat(&mut self) {
@@ -375,6 +381,9 @@ impl<S: Storage> Node<S> {
             // must truncate the log where they diverge.
             // this is fine because they are not committed.
             if self.log[index].term != suffix[index - prefix_len].term {
+                if self.waiting_clients.contains_key(&(prefix_len - 1)) {
+                    log::error!("{} truncated log {:?} with a waiting client!", self.stamp(), prefix_len - 1);
+                }
                 self.log = self.log[..prefix_len - 1].to_vec();
             }
         }
@@ -392,7 +401,7 @@ impl<S: Storage> Node<S> {
 
         if leader_commit > self.commit_length {
             for i in self.commit_length..leader_commit - 1 {
-                self.state.apply_command(&self.log[i].command).expect("err applying command");
+                self.state.apply_command(self.log[i].command.clone()).expect("err applying command");
             }
 
             self.commit_length = leader_commit;
@@ -443,9 +452,13 @@ impl<S: Storage> Node<S> {
             // check for quorum
             if acks >= (self.nodes.len() / 2) + 1 {
                 log::info!("{} leader committing log {}", self.stamp(), self.commit_length);
-                self.state
-                    .apply_command(&self.log[self.commit_length].command)
+                let result = self.state
+                    .apply_command(self.log[self.commit_length].command.clone())
                     .expect("err applying command");
+
+                if let Some(client) = self.waiting_clients.remove(&self.commit_length) {
+                    client.send(CommandResponse::Result(result)).unwrap();
+                }
 
                 self.commit_length += 1;
             } else {
@@ -454,20 +467,14 @@ impl<S: Storage> Node<S> {
         }
     }
 
-    fn get_next_request(&self) -> Option<RaftRequest> {
-        self.incoming.try_recv().ok()
-    }
-
     fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
-        if let Some(message) = self.get_next_request() {
+        if let Some((message, client)) = self.incoming.try_recv().ok() {
             match message {
                 RaftRequest::CommandRequest(request) => {
-                    let from = request.sender;
-                    let response = RaftRequest::CommandResponse(self.broadcast_request(request));
-                    self.outgoing.send((response, from))?;
+                    self.broadcast_request(request, client.unwrap());
                 }
-                RaftRequest::CommandResponse(_response) => {
-                    todo!()
+                RaftRequest::CommandResponse(response) => {
+                    log::error!("{} receive a command response! {response:?}", self.stamp());
                 }
                 RaftRequest::LogRequest(request) => {
                     let from = request.sender;

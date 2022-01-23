@@ -26,15 +26,21 @@ pub enum RaftRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ReadRequest {
+    pub key: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandRequest {
-    pub sender: NodeID, // needed?
     pub command: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CommandResponse {
-    pub sender: Option<NodeID>, // needed?
-    pub reply: String,
+pub enum CommandResponse {
+    Result(String),
+    NotLeader(NodeID),
+    Unavailable,
+    Failed,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
