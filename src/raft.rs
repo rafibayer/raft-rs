@@ -17,12 +17,18 @@ pub struct LogEntry {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RaftRequest {
+    // Client interaction
     CommandRequest(CommandRequest),
     CommandResponse(CommandResponse),
+    
+    // Internal
     LogRequest(LogRequest),
     LogResponse(LogResponse),
     VoteRequest(VoteRequest),
     VoteResponse(VoteResponse),
+
+    // Admin
+    AdminRequest(AdminRequest),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,4 +80,12 @@ pub struct VoteResponse {
     pub sender: NodeID,
     pub term: usize,
     pub granted: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AdminRequest {
+    Shutdown,
+    BecomeLeader,
+    BecomeFollower,
+    BecomeCandidate,
 }

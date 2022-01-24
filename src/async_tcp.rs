@@ -3,18 +3,20 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::mpsc::{Receiver, Sender, self},
-    thread,
+    thread, time::Duration, error::Error,
 };
 
-use crate::{raft::{NodeID, RaftRequest, CommandRequest}, node::ClientConnection};
+use crate::{raft::{NodeID, RaftRequest, CommandRequest, AdminRequest}, node::ClientConnection};
 
-pub fn apply_command(command: CommandRequest, node: NodeID, cluster: &HashMap<NodeID, SocketAddr>) -> Result<String, String> {
-    let mut stream = TcpStream::connect(cluster[&node]).unwrap();
+pub fn apply_command(command: CommandRequest, node: NodeID, cluster: &HashMap<NodeID, SocketAddr>) -> Result<String, Box<dyn Error>> {
+    let address = cluster[&node];
+    let mut stream = connect_with_retries(address, Duration::from_millis(500), 10).unwrap();
 
-    send(&RaftRequest::CommandRequest(command.clone()), &mut stream);
+    send(&RaftRequest::CommandRequest(command.clone()), &mut stream)?;
 
-    let response = read(&mut stream);
+    let response = read(&mut stream)?;
 
+    stream.shutdown(std::net::Shutdown::Both)?;
     drop(stream);
 
     if let RaftRequest::CommandResponse(response) = response {
@@ -29,65 +31,82 @@ pub fn apply_command(command: CommandRequest, node: NodeID, cluster: &HashMap<No
         }
     } else {
         log::error!("Client receive an unexpected message type: {response:?}");
-        return Err(String::from("Client receive an unexpected message type"))
+        Err("Client receive an unexpected message type".into())
     }
 }
 
-fn send(request: &RaftRequest, stream: &mut TcpStream) {
-    let serialized = bincode::serialize(&request).unwrap();
-    let size = serialized.len();
-
-    stream.write_all(&size.to_ne_bytes()).unwrap();
-    stream.flush().unwrap();
-
-    stream.write_all(&serialized).unwrap();
-    stream.flush().unwrap();
+pub fn admin(request: AdminRequest, address: SocketAddr) {
+    let mut stream = connect_with_retries(address, Duration::from_millis(500), 10).unwrap();
+    send(&RaftRequest::AdminRequest(request), &mut stream).unwrap();
 }
 
-fn read(stream: &mut TcpStream) -> RaftRequest {
+fn send(request: &RaftRequest, stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
+    let serialized = bincode::serialize(&request)?;
+    let size = serialized.len();
+
+    stream.write_all(&size.to_ne_bytes())?;
+    stream.flush()?;
+
+    stream.write_all(&serialized)?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+fn read(stream: &mut TcpStream) -> Result<RaftRequest, Box<dyn Error>> {
     let mut size_buf = [0; 8];
-    stream.read_exact(&mut size_buf).unwrap();
+    stream.read_exact(&mut size_buf)?;
 
     let content_length: usize = usize::from_ne_bytes(size_buf);
     let mut buffer = vec![0; content_length];
 
-    stream.read_exact(&mut buffer).unwrap();
-    bincode::deserialize(&buffer).unwrap()
+    stream.read_exact(&mut buffer)?;
+    Ok(bincode::deserialize(&buffer)?)
 }
 
-pub fn incoming_listener(address: SocketAddr, incoming: Sender<(RaftRequest, Option<ClientConnection>)>) {
+pub fn inbox_thread(node: NodeID, address: SocketAddr, incoming: Sender<(RaftRequest, Option<ClientConnection>)>) {
     let listener = TcpListener::bind(address).unwrap();
     for stream in listener.incoming() {
         let stream = stream.unwrap();
         let incoming_clone = incoming.clone();
         thread::spawn(move || {
-            handle_connection(stream, incoming_clone);
+            if let Err(err) = handle_connection(stream, incoming_clone) {
+                log::error!("Node {node} inbox: Error handling connection: {err:?}");
+            }
         });
     }
 
-    log::error!("listener thread terminating!!!");
+    log::error!("inbox thread terminating!!!");
 }
 
-fn handle_connection(mut stream: TcpStream, incoming: Sender<(RaftRequest, Option<ClientConnection>)>) {
+fn handle_connection(mut stream: TcpStream, incoming: Sender<(RaftRequest, Option<ClientConnection>)>) -> Result<(), Box<dyn Error>> {
     loop {
-        let msg = read(&mut stream);
+        let msg = read(&mut stream)?;
         match msg {
             // client commands must be answered sync 
             RaftRequest::CommandRequest(_) => {
                 let (tx, rx) = mpsc::channel();
-                incoming.send((msg, Some(tx))).unwrap();
-                let response = rx.recv().unwrap();
-                send(&RaftRequest::CommandResponse(response), &mut stream);
+                incoming.send((msg, Some(tx)))?;
+                let response = rx.recv()?;
+                send(&RaftRequest::CommandResponse(response), &mut stream)?;
+                drop(stream);
 
                 // we don't keep client connections open, we can therefore return this thread.
-                return;
+                return Ok(());
             },
-            _ => incoming.send((msg, None)).unwrap()
+            RaftRequest::AdminRequest(_) => {
+                incoming.send((msg, None))?;
+                drop(stream);
+
+                // we don't keep admin connections open, we can therefore return this thread.
+                return Ok(());
+            }
+            _ => incoming.send((msg, None))?
         };
     }
 }
 
-pub fn outgoing_pusher(
+pub fn outbox_thread(
     id: NodeID,
     outgoing: Receiver<(RaftRequest, NodeID)>,
     nodes: HashMap<NodeID, SocketAddr>,
@@ -99,8 +118,28 @@ pub fn outgoing_pusher(
 
     for (req, node) in outgoing.into_iter() {
         assert_ne!(node, id);
-        send(&req, connections.get_mut(&node).unwrap());
+
+        // todo: if this fails bc of connection we need to reconnect instead of hammering
+        // this closed stream. need some logic to remove connection/reconnect
+        let mut stream = connections.get_mut(&node).unwrap();
+        if let Err(err) = send(&req, &mut stream) {
+            log::error!("Node {id} outbox: Error sending message {req:?} to {node}: {err:?}");
+        }
     }
 
-    log::error!("pusher thread terminating!!!");
+    log::error!("outbox thread terminating!!!");
 }
+
+fn connect_with_retries(address: SocketAddr, delay: Duration, attempts: usize) -> Result<TcpStream, String> {
+    for i in 0..attempts {
+        if let Ok(stream) = TcpStream::connect(address) {
+            return Ok(stream);
+        }
+
+        log::warn!("failed to connect to {address:?} after {} attemps. Retrying in {delay:?}", i+1);
+        thread::sleep(delay);
+    } 
+
+    Err(format!("Failed to connect to {address:?} after {attempts} attempts"))
+}
+

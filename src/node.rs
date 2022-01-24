@@ -1,25 +1,26 @@
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use std::{error, thread};
 
-use crate::async_tcp::{incoming_listener, outgoing_pusher};
+use log::info;
+
+use crate::async_tcp::{inbox_thread, outbox_thread};
 use crate::raft::{
     CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
-    VoteRequest, VoteResponse, ReadRequest,
+    VoteRequest, VoteResponse,
 };
 use crate::state::Storage;
 use crate::utils;
 
 // should be long, allow time for elections to reach all nodes
 const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
-    Duration::from_millis(1000)..=Duration::from_millis(2500);
+    Duration::from_millis(150)..=Duration::from_millis(300);
 
 // should be very low, need establish authority and stop other elections
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(1);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
 
 
 pub type ClientConnection = Sender<CommandResponse>;
@@ -55,6 +56,8 @@ pub struct Node<S: Storage<String, String>> {
     incoming: Receiver<(RaftRequest, Option<ClientConnection>)>,
 
     state: S,
+
+    shutdown: bool,
 }
 
 impl<S: Storage<String, String>> Node<S> {
@@ -66,14 +69,14 @@ impl<S: Storage<String, String>> Node<S> {
         thread::spawn(move || {
             // will send incoming requests to tx_incoming.
             // node will get them from incoming: rx_incoming
-            incoming_listener(address, tx_incoming);
+            inbox_thread(id, address, tx_incoming);
         });
 
         let node_clone = nodes.clone();
         thread::spawn(move || {
             // will receive outgoing requests from rx_outgoing.
             // node will send them from tx_outgoing
-            outgoing_pusher(id, rx_outgoing, node_clone);
+            outbox_thread(id, rx_outgoing, node_clone);
         });
 
         log::info!("[Node {}] Initializing...", id);
@@ -92,7 +95,7 @@ impl<S: Storage<String, String>> Node<S> {
 
             // implementation details
             t_heartbeat_received: Instant::now(),
-            t_heartbeat_sent: Instant::now(), // 0?
+            t_heartbeat_sent: Instant::now(),
             election_timeout: utils::rand_duration(ELECTION_TIMEOUT), // 0? since we set on become follower
             t_election_start: Instant::now(),
             nodes,
@@ -103,15 +106,17 @@ impl<S: Storage<String, String>> Node<S> {
             incoming: rx_incoming,
 
             state,
+
+            shutdown: false
         }
     }
 
-    pub fn start(&mut self) {
+    pub fn start(self) {
         log::info!("{} starting", self.stamp());
         self.event_loop();
     }
 
-    fn event_loop(&mut self) -> ! {
+    fn event_loop(mut self) {
         loop {
             self.process_message().unwrap();
 
@@ -120,6 +125,18 @@ impl<S: Storage<String, String>> Node<S> {
                 Role::Candidate => self.candidate(),
                 Role::Leader => self.leader(),
             };
+
+            if self.shutdown {
+                // this isn't enough, dropping channels doesn't stop the threads.
+
+                // here we close outgoing, which does stop outbox
+                drop(self.outgoing);
+
+                // TcpListener is still handling connections, but nobody is answering
+                drop(self.incoming);
+
+                return;
+            }
         }
     }
 
@@ -168,6 +185,7 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn become_leader(&mut self) {
+        info!("{} becoming leader", self.stamp());
         self.current_role = Role::Leader;
         self.current_leader = Some(self.id);
 
@@ -258,7 +276,7 @@ impl<S: Storage<String, String>> Node<S> {
             self.votes_received.insert(response.sender);
 
             // check for quorum
-            if self.votes_received.len() >= (self.nodes.len() / 2) + 1 {
+            if self.votes_received.len() > self.nodes.len() / 2 {
                 log::info!(
                     "{} ****** received a quorum with {} votes ******",
                     self.stamp(),
@@ -450,12 +468,13 @@ impl<S: Storage<String, String>> Node<S> {
             }
 
             // check for quorum
-            if acks >= (self.nodes.len() / 2) + 1 {
+            if acks > self.nodes.len() / 2 {
                 log::info!("{} leader committing log {}", self.stamp(), self.commit_length);
                 let result = self.state
                     .apply_command(self.log[self.commit_length].command.clone())
                     .expect("err applying command");
 
+                // notify waiting client of commit
                 if let Some(client) = self.waiting_clients.remove(&self.commit_length) {
                     client.send(CommandResponse::Result(result)).unwrap();
                 }
@@ -468,13 +487,13 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
-        if let Some((message, client)) = self.incoming.try_recv().ok() {
+        if let Ok((message, client)) = self.incoming.try_recv() {
             match message {
                 RaftRequest::CommandRequest(request) => {
                     self.broadcast_request(request, client.unwrap());
                 }
                 RaftRequest::CommandResponse(response) => {
-                    log::error!("{} receive a command response! {response:?}", self.stamp());
+                    log::error!("{} received a command response! {response:?}", self.stamp());
                 }
                 RaftRequest::LogRequest(request) => {
                     let from = request.sender;
@@ -486,12 +505,14 @@ impl<S: Storage<String, String>> Node<S> {
                 }
                 RaftRequest::VoteRequest(request) => {
                     let from = request.sender;
-
                     let response = RaftRequest::VoteResponse(self.receive_vote_request(request));
                     self.outgoing.send((response, from))?;
                 }
                 RaftRequest::VoteResponse(response) => {
                     self.receive_vote_response(response);
+                }
+                RaftRequest::AdminRequest(request) => {
+                    self.receive_admin_request(request);
                 }
             }
         }
@@ -499,13 +520,34 @@ impl<S: Storage<String, String>> Node<S> {
         Ok(())
     }
 
+    fn receive_admin_request(&mut self, request: crate::raft::AdminRequest) {
+        log::warn!("{} received admin request: {request:?}", self.stamp());
+
+        match request {
+            crate::raft::AdminRequest::Shutdown => {
+                // need to force close inbox/outbox.
+                // even though we're no longer processing messages, we're still listening on TCP
+                
+                self.shutdown = true
+            },
+            crate::raft::AdminRequest::BecomeLeader => {
+                self.current_term += 1;
+                self.become_leader();
+            },
+            crate::raft::AdminRequest::BecomeFollower => self.become_follower(self.current_term),
+            crate::raft::AdminRequest::BecomeCandidate => self.become_candidate(),
+        }
+    }
+
     #[inline]
     fn followers(&self) -> Vec<NodeID> {
-        self.nodes.keys().map(|k| *k).filter(|k| *k != self.id).collect()
+        self.nodes.keys().cloned().filter(|k| *k != self.id).collect()
     }
 
     #[inline]
     fn stamp(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }
+
+    
 }
