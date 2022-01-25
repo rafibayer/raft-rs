@@ -49,14 +49,12 @@ fn main() {
     thread::sleep(Duration::from_secs(2));
 
     log::warn!("***************** BECOME LEADER: 0 *****************");
-    client.admin(0, AdminRequest::BecomeLeader).unwrap();
-
-    thread::sleep(Duration::from_secs(2));
+    let res = client.admin(0, AdminRequest::BecomeLeader).unwrap();
+    log::info!("Admin response: {res:?}");
 
     log::warn!("***************** SHUTDOWN: 0 *****************");
-    client.admin(0, AdminRequest::Shutdown).unwrap();
-
-    thread::sleep(Duration::from_secs(2));
+    let res = client.admin(0, AdminRequest::Shutdown).unwrap();
+    log::info!("Admin response: {res:?}");
 
     log::warn!("***************** SENDING *****************");
     for i in 1..=100 {

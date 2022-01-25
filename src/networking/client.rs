@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use crate::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest};
+use crate::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse};
 
 use super::async_tcp;
 
@@ -25,7 +25,7 @@ impl Client {
     ) -> Result<CommandResponse, Box<dyn error::Error>> {
         let mut stream = match self.cached_leader {
             Some(leader) => {
-                log::info!("Client trying to connect to cached leader: {leader}");
+                log::trace!("Client trying to connect to cached leader: {leader}");
                 let stream = async_tcp::connect_with_retries(
                     self.cluster[&leader],
                     Duration::from_millis(100),
@@ -33,7 +33,10 @@ impl Client {
                 );
                 match stream {
                     Ok(stream) => stream,
-                    Err(_) => self.connect_to_any_node()?,
+                    Err(_) => {
+                        self.cached_leader = None;
+                        self.connect_to_any_node()? 
+                    },
                 }
             }
             None => self.connect_to_any_node()?,
@@ -58,11 +61,16 @@ impl Client {
         Err("Client receive an unexpected message type".into())
     }
 
-    pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<(), Box<dyn error::Error>> {
+    pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<AdminResponse, Box<dyn error::Error>> {
         let mut stream =
             async_tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
+
         async_tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
-        Ok(())
+        let response = async_tcp::read(&mut stream)?;
+        match response {
+            RaftRequest::AdminResponse(response) => Ok(response),
+            other => Err(format!("Received unexpected response to admin request: {other:?}").into())
+        }
     }
 
     fn connect_to_any_node(&self) -> Result<TcpStream, Box<dyn error::Error>> {

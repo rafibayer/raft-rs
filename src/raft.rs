@@ -15,7 +15,7 @@ pub struct LogEntry {
     pub term: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum RaftRequest {
     // Client interaction
     CommandRequest(CommandRequest),
@@ -29,11 +29,7 @@ pub enum RaftRequest {
 
     // Admin
     AdminRequest(AdminRequest),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ReadRequest {
-    pub key: String,
+    AdminResponse(AdminResponse),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -41,7 +37,7 @@ pub struct CommandRequest {
     pub command: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CommandResponse {
     Result(String),
     NotLeader(NodeID),
@@ -49,7 +45,7 @@ pub enum CommandResponse {
     Failed,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogRequest {
     pub sender: NodeID,
     pub term: usize,
@@ -59,7 +55,7 @@ pub struct LogRequest {
     pub suffix: Vec<LogEntry>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogResponse {
     pub sender: NodeID,
     pub term: usize,
@@ -67,7 +63,7 @@ pub struct LogResponse {
     pub success: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VoteRequest {
     pub sender: NodeID,
     pub term: usize,
@@ -75,17 +71,42 @@ pub struct VoteRequest {
     pub last_log_term: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct VoteResponse {
     pub sender: NodeID,
     pub term: usize,
     pub granted: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum AdminRequest {
     Shutdown,
     BecomeLeader,
     BecomeFollower,
     BecomeCandidate,
+
+    GetLeader,
+    GetLogLength,
+    GetTerm,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum AdminResponse {
+    /// generic "Done" response for admin action
+    Done,
+    
+    // query admin request responses
+    Leader(NodeID),
+    LogLength(usize),
+    Term(usize),
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
+pub enum Event {
+    ShutdownCompleted,
+    BecameLeader,
+    BecameCandidate,
+    BecameFollower,
+    CommittedLog(usize),
 }

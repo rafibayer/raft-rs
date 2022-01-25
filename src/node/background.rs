@@ -13,12 +13,12 @@ use crate::{
     raft::{NodeID, RaftRequest},
 };
 
-use super::ClientConnection;
+use super::SyncConnection;
 
 pub fn inbox_thread(
     id: NodeID,
     address: SocketAddr,
-    incoming: Sender<(RaftRequest, Option<ClientConnection>)>,
+    incoming: Sender<(RaftRequest, Option<SyncConnection>)>,
     shutdown_signal: Receiver<()>,
 ) {
     let listener = TcpListener::bind(address).unwrap();
@@ -51,7 +51,7 @@ pub fn inbox_thread(
 
 fn handle_connection(
     mut stream: TcpStream,
-    incoming: Sender<(RaftRequest, Option<ClientConnection>)>,
+    incoming: Sender<(RaftRequest, Option<SyncConnection>)>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         let msg = async_tcp::read(&mut stream)?;
@@ -61,19 +61,31 @@ fn handle_connection(
                 let (tx, rx) = mpsc::channel();
                 incoming.send((msg, Some(tx)))?;
                 let response = rx.recv()?;
-                async_tcp::send(&RaftRequest::CommandResponse(response), &mut stream)?;
-                drop(stream);
+                if let RaftRequest::CommandResponse(response) = response {
+                    async_tcp::send(&RaftRequest::CommandResponse(response), &mut stream)?;
+                    drop(stream);
 
-                // we don't keep client connections open, we can therefore return this thread.
-                return Ok(());
+                    // we don't keep client connections open, we can therefore return this thread.
+                    return Ok(());
+                }
+
+                log::error!("Command request received an unexpected response type: {response:?}");
             }
             // admin commands must be answered sync
             RaftRequest::AdminRequest(_) => {
-                incoming.send((msg, None))?;
-                drop(stream);
+                let (tx, rx) = mpsc::channel();
+                incoming.send((msg, Some(tx)))?;
+                let response = rx.recv()?;
+                if let RaftRequest::AdminResponse(response) = response {
+                    async_tcp::send(&RaftRequest::AdminResponse(response), &mut stream)?;
+                    drop(stream);
 
-                // we don't keep admin connections open, we can therefore return this thread.
-                return Ok(());
+                    // we don't keep client connections open, we can therefore return this thread.
+                    return Ok(());
+                }
+
+                log::error!("Admin request received an unexpected response type: {response:?}");
+
             }
             _ => incoming.send((msg, None))?,
         };

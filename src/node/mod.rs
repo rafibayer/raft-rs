@@ -13,14 +13,14 @@ use background::{inbox_thread, outbox_thread};
 
 use crate::raft::{
     CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
-    VoteRequest, VoteResponse,
+    VoteRequest, VoteResponse, AdminResponse, Event, AdminRequest,
 };
 use crate::state::Storage;
 use crate::utils;
 
 use self::config::{Config, InternalConfig};
 
-pub type ClientConnection = Sender<CommandResponse>;
+type SyncConnection = Sender<RaftRequest>;
 
 pub struct Node<S: Storage<String, String>> {
     // stable
@@ -44,13 +44,13 @@ pub struct Node<S: Storage<String, String>> {
     t_election_start: Instant,
     config: InternalConfig,
 
-    waiting_clients: HashMap<usize, ClientConnection>,
+    waiting_events: HashMap<Event, Vec<SyncConnection>>,
 
     // outgoing requests and responses
     outgoing: Sender<(RaftRequest, NodeID)>,
 
     // incoming requests and responses
-    incoming: Receiver<(RaftRequest, Option<ClientConnection>)>,
+    incoming: Receiver<(RaftRequest, Option<SyncConnection>)>,
 
     state: S,
 
@@ -102,7 +102,7 @@ impl<S: Storage<String, String>> Node<S> {
             t_election_start: Instant::now(),
             config,
 
-            waiting_clients: HashMap::new(),
+            waiting_events: HashMap::new(),
 
             outgoing: tx_outgoing,
             incoming: rx_incoming,
@@ -130,11 +130,17 @@ impl<S: Storage<String, String>> Node<S> {
             };
 
             if self.shutdown {
-                // here we close outgoing, which does stop outbox
-                drop(self.outgoing);
-
                 self.shutdown_signal.send(()).unwrap();
 
+                // if shutdown takes longer, we may notify early
+                thread::sleep(Duration::from_millis(1000));
+
+                self.notify_send(Event::ShutdownCompleted, RaftRequest::AdminResponse(AdminResponse::Done));
+
+                // here we close outgoing, which does stop outbox.
+                // note this happens after we notify, because we can't notify after dropping self.
+                drop(self.outgoing);
+                
                 return;
             }
         }
@@ -188,6 +194,8 @@ impl<S: Storage<String, String>> Node<S> {
         info!("{} becoming leader", self.stamp());
         self.current_role = Role::Leader;
         self.current_leader = Some(self.id);
+
+        self.notify_send(Event::BecameLeader, RaftRequest::AdminResponse(AdminResponse::Done));
 
         // replicate logs to other nodes
         for follower in self.followers() {
@@ -288,7 +296,7 @@ impl<S: Storage<String, String>> Node<S> {
         }
     }
 
-    fn broadcast_request(&mut self, message: CommandRequest, client: ClientConnection) {
+    fn broadcast_request(&mut self, message: CommandRequest, client: SyncConnection) {
         if self.current_role == Role::Leader {
             log::trace!("{} received broadcast request as leader", self.stamp());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
@@ -298,15 +306,15 @@ impl<S: Storage<String, String>> Node<S> {
                 self.replicate_log(follower);
             }
 
-            // once we commit this log, we must notify the client
-            self.waiting_clients.insert(self.log.len() - 1, client);
+            self.subscribe(Event::CommittedLog(self.log.len() - 1), client);
+
         } else {
             // forward to leader or return Unavailable
             let response = match self.current_leader {
                 Some(leader) => CommandResponse::NotLeader(leader),
                 None => CommandResponse::Unavailable,
             };
-            client.send(response).unwrap();
+            client.send(RaftRequest::CommandResponse(response)).unwrap();
         }
     }
 
@@ -398,7 +406,8 @@ impl<S: Storage<String, String>> Node<S> {
             // must truncate the log where they diverge.
             // this is fine because they are not committed.
             if self.log[index].term != suffix[index - prefix_len].term {
-                if self.waiting_clients.contains_key(&(prefix_len - 1)) {
+                
+                if self.waiting_events.contains_key(&Event::CommittedLog(prefix_len - 1)) {
                     log::error!(
                         "{} truncated log {:?} with a waiting client!",
                         self.stamp(),
@@ -479,11 +488,8 @@ impl<S: Storage<String, String>> Node<S> {
                     .state
                     .apply_command(self.log[self.commit_length].command.clone())
                     .expect("err applying command");
-
-                // notify waiting client of commit
-                if let Some(client) = self.waiting_clients.remove(&self.commit_length) {
-                    client.send(CommandResponse::Result(result)).unwrap();
-                }
+                
+                self.notify_send(Event::CommittedLog(self.commit_length), RaftRequest::CommandResponse(CommandResponse::Result(result)));
 
                 self.commit_length += 1;
             } else {
@@ -518,29 +524,57 @@ impl<S: Storage<String, String>> Node<S> {
                     self.receive_vote_response(response);
                 }
                 RaftRequest::AdminRequest(request) => {
-                    self.receive_admin_request(request);
+                    self.receive_admin_request(request, client.unwrap());
                 }
+                RaftRequest::AdminResponse(response) => {
+                    log::error!("{} recieved an admin response as a node: {response:?}", self.stamp());
+                },
             }
         }
 
         Ok(())
     }
 
-    fn receive_admin_request(&mut self, request: crate::raft::AdminRequest) {
+    fn receive_admin_request(&mut self, request: AdminRequest, client: SyncConnection) {
         log::warn!("{} received admin request: {request:?}", self.stamp());
 
         match request {
-            crate::raft::AdminRequest::Shutdown => {
+            AdminRequest::Shutdown => {
+                self.subscribe(Event::ShutdownCompleted, client);
                 // shutdown will begin next iteration of the event loop
                 self.shutdown = true
             }
-            crate::raft::AdminRequest::BecomeLeader => {
+            AdminRequest::BecomeLeader => {
+                self.subscribe(Event::BecameLeader, client);
                 self.current_term += 1;
                 self.become_leader();
             }
-            crate::raft::AdminRequest::BecomeFollower => self.become_follower(self.current_term),
-            crate::raft::AdminRequest::BecomeCandidate => self.become_candidate(),
+            AdminRequest::BecomeFollower => self.become_follower(self.current_term),
+            AdminRequest::BecomeCandidate => self.become_candidate(),
+            AdminRequest::GetLeader => todo!(),
+            AdminRequest::GetLogLength => todo!(),
+            AdminRequest::GetTerm => todo!(),
         }
+    }
+
+    fn notify<F: Fn(SyncConnection)>(&mut self, event: Event, notify: F) {
+        if let Some(conns) = self.waiting_events.remove(&event) {
+            for conn in conns {
+                notify(conn);
+            }
+        }
+    }
+
+    fn notify_send(&mut self, event: Event, send: RaftRequest) {
+        if let Some(conns) = self.waiting_events.remove(&event) {
+            for conn in conns {
+                conn.send(send.clone()).unwrap();
+            }
+        }
+    }
+
+    fn subscribe(&mut self, event: Event, conn: SyncConnection) {
+        self.waiting_events.entry(event).or_insert(vec![]).push(conn);
     }
 
     #[inline]
