@@ -1,6 +1,17 @@
-use std::{sync::mpsc::{Receiver, Sender, self}, net::{SocketAddr, TcpStream, TcpListener}, collections::HashMap, thread, io, time::Duration, error::Error};
+use std::{
+    collections::HashMap,
+    error::Error,
+    io,
+    net::{SocketAddr, TcpListener, TcpStream},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
+    time::Duration,
+};
 
-use crate::{raft::{NodeID, RaftRequest}, networking::async_tcp};
+use crate::{
+    networking::async_tcp,
+    raft::{NodeID, RaftRequest},
+};
 
 use super::ClientConnection;
 
@@ -8,7 +19,7 @@ pub fn inbox_thread(
     id: NodeID,
     address: SocketAddr,
     incoming: Sender<(RaftRequest, Option<ClientConnection>)>,
-    shutdown: Receiver<()>,
+    shutdown_signal: Receiver<()>,
 ) {
     let listener = TcpListener::bind(address).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -19,7 +30,7 @@ pub fn inbox_thread(
                 let incoming_clone = incoming.clone();
                 thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();
-                    if let Err(err) =  handle_connection(stream, incoming_clone) {
+                    if let Err(err) = handle_connection(stream, incoming_clone) {
                         log::error!("node {id} failed to handle a connection {err:?}");
                     }
                 });
@@ -29,7 +40,7 @@ pub fn inbox_thread(
             }
             Err(e) => panic!("{id} encountered listener error: {}", e),
         }
-        if shutdown.try_recv().is_ok() {
+        if shutdown_signal.try_recv().is_ok() {
             break;
         }
         thread::sleep(Duration::from_millis(1));
@@ -84,8 +95,8 @@ pub fn outbox_thread(
 
         // todo: if this fails bc of connection we need to reconnect instead of hammering
         // this closed stream. need some logic to remove connection/reconnect
-        let mut stream = connections.get_mut(&node).unwrap();
-        if let Err(err) = async_tcp::send(&req, &mut stream) {
+        let stream = connections.get_mut(&node).unwrap();
+        if let Err(err) = async_tcp::send(&req, stream) {
             log::trace!("Node {id} outbox: Error sending message to {node}: {err:?}");
         }
     }

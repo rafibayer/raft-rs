@@ -1,19 +1,12 @@
 use std::{
-    collections::HashMap,
     error::Error,
-    io::{self, Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
-    sync::mpsc::{self, Receiver, Sender},
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
     thread,
     time::Duration,
 };
 
-use crate::{
-    raft::{AdminRequest, CommandRequest, NodeID, RaftRequest},
-};
-
-
-
+use crate::raft::RaftRequest;
 
 pub fn send(request: &RaftRequest, stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
     let serialized = bincode::serialize(&request)?;

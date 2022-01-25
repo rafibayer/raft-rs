@@ -4,21 +4,18 @@ mod raft;
 mod state;
 mod utils;
 
+#[cfg(test)]
+mod test;
+
 use std::{collections::HashMap, thread, time::Duration};
 
 use raft::CommandRequest;
-use rand::Rng;
+
 use simple_logger::SimpleLogger;
 
 use node::Node;
 
-use crate::{
-    networking::{async_tcp, client::Client},
-    raft::AdminRequest,
-};
-
-#[cfg(test)]
-mod test;
+use crate::{networking::client::Client, raft::AdminRequest, node::config::Config};
 
 fn main() {
     SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
@@ -34,10 +31,17 @@ fn main() {
 
     let mut client = Client::new(cluster.clone());
 
+    let config = Config {
+        cluster,
+        election_timeout_min_ms: 150,
+        election_timeout_max_ms: 350,
+        heartbeat_interval_ms: 50,
+    };
+
     for i in 0..n {
-        let cluster = cluster.clone();
+        let config = config.clone();
         thread::spawn(move || {
-            let node = Node::new(i, cluster, HashMap::new());
+            let node = Node::new(i, config, HashMap::new());
             node.start();
         });
     }

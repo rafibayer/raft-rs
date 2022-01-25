@@ -1,34 +1,41 @@
-use std::{collections::HashMap, net::{SocketAddr, TcpStream}, time::Duration, error};
+use std::{
+    collections::HashMap,
+    error,
+    net::{SocketAddr, TcpStream},
+    time::Duration,
+};
 
-use crate::raft::{NodeID, CommandRequest, CommandResponse, RaftRequest, AdminRequest};
+use crate::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest};
 
 use super::async_tcp;
 
-
-
 pub struct Client {
     cached_leader: Option<NodeID>,
-    cluster: HashMap<NodeID, SocketAddr>
+    cluster: HashMap<NodeID, SocketAddr>,
 }
 
 impl Client {
     pub fn new(cluster: HashMap<NodeID, SocketAddr>) -> Self {
-        Client {
-            cached_leader: None,
-            cluster,
-        }
+        Client { cached_leader: None, cluster }
     }
 
-    pub fn apply_command(&mut self, command: CommandRequest) -> Result<CommandResponse, Box<dyn error::Error>> {
+    pub fn apply_command(
+        &mut self,
+        command: CommandRequest,
+    ) -> Result<CommandResponse, Box<dyn error::Error>> {
         let mut stream = match self.cached_leader {
             Some(leader) => {
                 log::info!("Client trying to connect to cached leader: {leader}");
-                let stream = async_tcp::connect_with_retries(self.cluster[&leader], Duration::from_millis(100), 3);
+                let stream = async_tcp::connect_with_retries(
+                    self.cluster[&leader],
+                    Duration::from_millis(100),
+                    3,
+                );
                 match stream {
                     Ok(stream) => stream,
-                    Err(_) =>  self.connect_to_any_node()?,
+                    Err(_) => self.connect_to_any_node()?,
                 }
-            },
+            }
             None => self.connect_to_any_node()?,
         };
 
@@ -41,18 +48,19 @@ impl Client {
                 crate::raft::CommandResponse::NotLeader(leader) => {
                     log::info!("Client received NotLeader, trying leader: {leader}");
                     self.cached_leader = Some(leader);
-                    return self.apply_command(command)
+                    return self.apply_command(command);
                 }
                 CommandResponse::Unavailable => todo!(),
                 CommandResponse::Failed => todo!(),
-            }
+            };
         }
         log::error!("Client receive an unexpected message type: {response:?}");
         Err("Client receive an unexpected message type".into())
     }
 
     pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<(), Box<dyn error::Error>> {
-        let mut stream = async_tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
+        let mut stream =
+            async_tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
         async_tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
         Ok(())
     }
@@ -69,6 +77,4 @@ impl Client {
 
         Err("Could not connect to any node".to_string().into())
     }
-
-
 }

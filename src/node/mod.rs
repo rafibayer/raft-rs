@@ -1,8 +1,8 @@
 mod background;
+pub mod config;
 
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use std::{error, thread};
@@ -18,12 +18,7 @@ use crate::raft::{
 use crate::state::Storage;
 use crate::utils;
 
-// should be long, allow time for elections to reach all nodes
-const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
-    Duration::from_millis(150)..=Duration::from_millis(300);
-
-// should be very low, need establish authority and stop other elections
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
+use self::config::{Config, InternalConfig};
 
 pub type ClientConnection = Sender<CommandResponse>;
 
@@ -47,7 +42,7 @@ pub struct Node<S: Storage<String, String>> {
     t_heartbeat_sent: Instant,
     election_timeout: Duration,
     t_election_start: Instant,
-    nodes: HashMap<NodeID, SocketAddr>,
+    config: InternalConfig,
 
     waiting_clients: HashMap<usize, ClientConnection>,
 
@@ -60,30 +55,31 @@ pub struct Node<S: Storage<String, String>> {
     state: S,
 
     shutdown: bool,
-    sig_shutdown: Sender<()>,
+    shutdown_signal: Sender<()>,
 }
 
 impl<S: Storage<String, String>> Node<S> {
-    pub fn new(id: usize, nodes: HashMap<NodeID, SocketAddr>, state: S) -> Self {
+    pub fn new(id: usize, config: Config, state: S) -> Self {
         let (tx_shutdown, rx_shutdown) = mpsc::channel();
 
         let (tx_outgoing, rx_outgoing) = mpsc::channel();
         let (tx_incoming, rx_incoming) = mpsc::channel();
 
-        
-        let address = nodes[&id];
+        let address = config.cluster[&id];
         thread::spawn(move || {
             // will send incoming requests to tx_incoming.
             // node will get them from incoming: rx_incoming
             inbox_thread(id, address, tx_incoming, rx_shutdown);
         });
 
-        let node_clone = nodes.clone();
+        let cluster_clone = config.cluster.clone();
         thread::spawn(move || {
             // will receive outgoing requests from rx_outgoing.
             // node will send them from tx_outgoing
-            outbox_thread(id, rx_outgoing, node_clone);
+            outbox_thread(id, rx_outgoing, cluster_clone);
         });
+
+        let config = InternalConfig::from(config);
 
         log::info!("[Node {}] Initializing...", id);
         Node {
@@ -102,9 +98,9 @@ impl<S: Storage<String, String>> Node<S> {
             // implementation details
             t_heartbeat_received: Instant::now(),
             t_heartbeat_sent: Instant::now(),
-            election_timeout: utils::rand_duration(ELECTION_TIMEOUT), // 0? since we set on become follower
+            election_timeout: utils::rand_duration(config.election_timeout_range.clone()), // 0? since we set on become follower
             t_election_start: Instant::now(),
-            nodes,
+            config,
 
             waiting_clients: HashMap::new(),
 
@@ -114,7 +110,7 @@ impl<S: Storage<String, String>> Node<S> {
             state,
 
             shutdown: false,
-            sig_shutdown: tx_shutdown,
+            shutdown_signal: tx_shutdown,
         }
     }
 
@@ -134,11 +130,10 @@ impl<S: Storage<String, String>> Node<S> {
             };
 
             if self.shutdown {
-
                 // here we close outgoing, which does stop outbox
                 drop(self.outgoing);
 
-                self.sig_shutdown.send(()).unwrap();
+                self.shutdown_signal.send(()).unwrap();
 
                 return;
             }
@@ -167,7 +162,7 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn leader(&mut self) {
-        if Instant::now() > self.t_heartbeat_sent + HEARTBEAT_INTERVAL {
+        if Instant::now() > self.t_heartbeat_sent + self.config.heartbeat_interval {
             self.send_heartbeat();
         }
     }
@@ -175,7 +170,7 @@ impl<S: Storage<String, String>> Node<S> {
     fn become_follower(&mut self, term: usize) {
         self.current_role = Role::Follower;
         self.current_term = term;
-        self.election_timeout = utils::rand_duration(ELECTION_TIMEOUT);
+        self.election_timeout = utils::rand_duration(self.config.election_timeout_range.clone());
     }
 
     fn become_candidate(&mut self) {
@@ -281,7 +276,7 @@ impl<S: Storage<String, String>> Node<S> {
             self.votes_received.insert(response.sender);
 
             // check for quorum
-            if self.votes_received.len() > self.nodes.len() / 2 {
+            if self.votes_received.len() > self.config.cluster.len() / 2 {
                 log::info!(
                     "{} ****** received a quorum with {} votes ******",
                     self.stamp(),
@@ -305,7 +300,6 @@ impl<S: Storage<String, String>> Node<S> {
 
             // once we commit this log, we must notify the client
             self.waiting_clients.insert(self.log.len() - 1, client);
-
         } else {
             // forward to leader or return Unavailable
             let response = match self.current_leader {
@@ -405,7 +399,11 @@ impl<S: Storage<String, String>> Node<S> {
             // this is fine because they are not committed.
             if self.log[index].term != suffix[index - prefix_len].term {
                 if self.waiting_clients.contains_key(&(prefix_len - 1)) {
-                    log::error!("{} truncated log {:?} with a waiting client!", self.stamp(), prefix_len - 1);
+                    log::error!(
+                        "{} truncated log {:?} with a waiting client!",
+                        self.stamp(),
+                        prefix_len - 1
+                    );
                 }
                 self.log = self.log[..prefix_len - 1].to_vec();
             }
@@ -424,7 +422,9 @@ impl<S: Storage<String, String>> Node<S> {
 
         if leader_commit > self.commit_length {
             for i in self.commit_length..leader_commit - 1 {
-                self.state.apply_command(self.log[i].command.clone()).expect("err applying command");
+                self.state
+                    .apply_command(self.log[i].command.clone())
+                    .expect("err applying command");
             }
 
             self.commit_length = leader_commit;
@@ -466,16 +466,17 @@ impl<S: Storage<String, String>> Node<S> {
         while self.commit_length < self.log.len() {
             // count acks
             let mut acks = 0;
-            for node in self.nodes.keys() {
+            for node in self.config.cluster.keys() {
                 if self.acked_length[node] > self.commit_length {
                     acks += 1;
                 }
             }
 
             // check for quorum
-            if acks > self.nodes.len() / 2 {
+            if acks > self.config.cluster.len() / 2 {
                 log::info!("{} leader committing log {}", self.stamp(), self.commit_length);
-                let result = self.state
+                let result = self
+                    .state
                     .apply_command(self.log[self.commit_length].command.clone())
                     .expect("err applying command");
 
@@ -530,15 +531,13 @@ impl<S: Storage<String, String>> Node<S> {
 
         match request {
             crate::raft::AdminRequest::Shutdown => {
-                // need to force close inbox/outbox.
-                // even though we're no longer processing messages, we're still listening on TCP
-                
+                // shutdown will begin next iteration of the event loop
                 self.shutdown = true
-            },
+            }
             crate::raft::AdminRequest::BecomeLeader => {
                 self.current_term += 1;
                 self.become_leader();
-            },
+            }
             crate::raft::AdminRequest::BecomeFollower => self.become_follower(self.current_term),
             crate::raft::AdminRequest::BecomeCandidate => self.become_candidate(),
         }
@@ -546,7 +545,7 @@ impl<S: Storage<String, String>> Node<S> {
 
     #[inline]
     fn followers(&self) -> Vec<NodeID> {
-        self.nodes.keys().cloned().filter(|k| *k != self.id).collect()
+        self.config.cluster.keys().cloned().filter(|k| *k != self.id).collect()
     }
 
     #[inline]

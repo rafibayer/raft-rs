@@ -20,7 +20,7 @@ pub enum RaftRequest {
     // Client interaction
     CommandRequest(CommandRequest),
     CommandResponse(CommandResponse),
-    
+
     // Internal
     LogRequest(LogRequest),
     LogResponse(LogResponse),
