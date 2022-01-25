@@ -1,4 +1,4 @@
-mod async_tcp;
+mod networking;
 mod node;
 mod raft;
 mod state;
@@ -6,13 +6,16 @@ mod utils;
 
 use std::{collections::HashMap, thread, time::Duration};
 
-use raft::{CommandRequest};
+use raft::CommandRequest;
 use rand::Rng;
 use simple_logger::SimpleLogger;
 
 use node::Node;
 
-use crate::{async_tcp::admin, raft::AdminRequest};
+use crate::{
+    networking::{async_tcp, client::Client},
+    raft::AdminRequest,
+};
 
 #[cfg(test)]
 mod test;
@@ -29,6 +32,8 @@ fn main() {
         cluster.insert(i, format!("127.0.0.1:{}", port + i).parse().unwrap());
     }
 
+    let mut client = Client::new(cluster.clone());
+
     for i in 0..n {
         let cluster = cluster.clone();
         thread::spawn(move || {
@@ -40,42 +45,25 @@ fn main() {
     thread::sleep(Duration::from_secs(2));
 
     log::warn!("***************** BECOME LEADER: 0 *****************");
-    admin(AdminRequest::BecomeLeader, cluster[&0]);
+    client.admin(0, AdminRequest::BecomeLeader).unwrap();
 
     thread::sleep(Duration::from_secs(2));
 
+    log::warn!("***************** SHUTDOWN: 0 *****************");
+    client.admin(0, AdminRequest::Shutdown).unwrap();
 
-    log::warn!("***************** FOLLOWER: 0 *****************");
-    admin(AdminRequest::BecomeFollower, cluster[&0]);
-    
+    thread::sleep(Duration::from_secs(2));
 
     log::warn!("***************** SENDING *****************");
-    let mut handles = Vec::new();
-    for thread in 0..1 {
-        let cluster_clone = cluster.clone();
-        handles.push(thread::spawn(move || {
-            for i in 1..=100 {
-                let x_val = i * (thread + 1);
-                async_tcp::apply_command(
-                    CommandRequest { command: format!("SET X {x_val}") },
-                    rand::thread_rng().gen_range(0..n),
-                    &cluster_clone,
-                )
-                .unwrap();
-            }
-        }));
-    }
-    
-    for handle in handles {
-        handle.join().unwrap();
+    for i in 1..=100 {
+        let x_val = i;
+        client.apply_command(CommandRequest { command: format!("SET X {x_val}") }).unwrap();
     }
 
     log::warn!("***************** VERIFYING *****************");
-    let result =
-        async_tcp::apply_command(CommandRequest { command: "GET X".to_string() }, 1, &cluster)
-            .unwrap();
+    let result = client.apply_command(CommandRequest { command: "GET X".to_string() }).unwrap();
 
-    println!("======= result: {result} =======");
+    println!("======= result: {result:?} =======");
 
     log::warn!("***************** TERMINATING *****************");
     thread::sleep(Duration::from_secs(3));

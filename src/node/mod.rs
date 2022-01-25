@@ -1,3 +1,5 @@
+mod background;
+
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -7,7 +9,8 @@ use std::{error, thread};
 
 use log::info;
 
-use crate::async_tcp::{inbox_thread, outbox_thread};
+use background::{inbox_thread, outbox_thread};
+
 use crate::raft::{
     CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
     VoteRequest, VoteResponse,
@@ -21,7 +24,6 @@ const ELECTION_TIMEOUT: std::ops::RangeInclusive<Duration> =
 
 // should be very low, need establish authority and stop other elections
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(50);
-
 
 pub type ClientConnection = Sender<CommandResponse>;
 
