@@ -9,7 +9,7 @@ use std::{
 };
 
 use crate::{
-    networking::async_tcp,
+    networking::tcp,
     raft::{NodeID, RaftRequest},
 };
 
@@ -54,7 +54,7 @@ fn handle_connection(
     incoming: Sender<(RaftRequest, Option<SyncConnection>)>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
-        let msg = async_tcp::read(&mut stream)?;
+        let msg = tcp::read(&mut stream)?;
         match msg {
             // client commands must be answered sync
             RaftRequest::CommandRequest(_) => {
@@ -62,7 +62,7 @@ fn handle_connection(
                 incoming.send((msg, Some(tx)))?;
                 let response = rx.recv()?;
                 if let RaftRequest::CommandResponse(response) = response {
-                    async_tcp::send(&RaftRequest::CommandResponse(response), &mut stream)?;
+                    tcp::send(&RaftRequest::CommandResponse(response), &mut stream)?;
                     drop(stream);
 
                     // we don't keep client connections open, we can therefore return this thread.
@@ -77,7 +77,7 @@ fn handle_connection(
                 incoming.send((msg, Some(tx)))?;
                 let response = rx.recv()?;
                 if let RaftRequest::AdminResponse(response) = response {
-                    async_tcp::send(&RaftRequest::AdminResponse(response), &mut stream)?;
+                    tcp::send(&RaftRequest::AdminResponse(response), &mut stream)?;
                     drop(stream);
 
                     // we don't keep client connections open, we can therefore return this thread.
@@ -108,7 +108,7 @@ pub fn outbox_thread(
         // todo: if this fails bc of connection we need to reconnect instead of hammering
         // this closed stream. need some logic to remove connection/reconnect
         let stream = connections.get_mut(&node).unwrap();
-        if let Err(err) = async_tcp::send(&req, stream) {
+        if let Err(err) = tcp::send(&req, stream) {
             log::trace!("Node {id} outbox: Error sending message to {node}: {err:?}");
         }
     }

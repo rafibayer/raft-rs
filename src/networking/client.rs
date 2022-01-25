@@ -7,7 +7,7 @@ use std::{
 
 use crate::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse};
 
-use super::async_tcp;
+use super::tcp;
 
 pub struct Client {
     cached_leader: Option<NodeID>,
@@ -26,7 +26,7 @@ impl Client {
         let mut stream = match self.cached_leader {
             Some(leader) => {
                 log::trace!("Client trying to connect to cached leader: {leader}");
-                let stream = async_tcp::connect_with_retries(
+                let stream = tcp::connect_with_retries(
                     self.cluster[&leader],
                     Duration::from_millis(100),
                     3,
@@ -42,8 +42,8 @@ impl Client {
             None => self.connect_to_any_node()?,
         };
 
-        async_tcp::send(&RaftRequest::CommandRequest(command.clone()), &mut stream)?;
-        let response = async_tcp::read(&mut stream)?;
+        tcp::send(&RaftRequest::CommandRequest(command.clone()), &mut stream)?;
+        let response = tcp::read(&mut stream)?;
 
         if let RaftRequest::CommandResponse(response) = response {
             return match response {
@@ -63,10 +63,10 @@ impl Client {
 
     pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<AdminResponse, Box<dyn error::Error>> {
         let mut stream =
-            async_tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
+            tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
 
-        async_tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
-        let response = async_tcp::read(&mut stream)?;
+        tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
+        let response = tcp::read(&mut stream)?;
         match response {
             RaftRequest::AdminResponse(response) => Ok(response),
             other => Err(format!("Received unexpected response to admin request: {other:?}").into())
@@ -75,7 +75,7 @@ impl Client {
 
     fn connect_to_any_node(&self) -> Result<TcpStream, Box<dyn error::Error>> {
         for (node, address) in &self.cluster {
-            let conn = async_tcp::connect_with_retries(*address, Duration::from_millis(50), 2);
+            let conn = tcp::connect_with_retries(*address, Duration::from_millis(50), 2);
             if let Ok(conn) = conn {
                 return Ok(conn);
             }

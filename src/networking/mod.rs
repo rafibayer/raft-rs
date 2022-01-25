@@ -1,2 +1,2 @@
-pub mod async_tcp;
+pub mod tcp;
 pub mod client;

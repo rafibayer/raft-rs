@@ -12,8 +12,8 @@ use log::info;
 use background::{inbox_thread, outbox_thread};
 
 use crate::raft::{
-    CommandRequest, CommandResponse, LogEntry, LogRequest, LogResponse, NodeID, RaftRequest, Role,
-    VoteRequest, VoteResponse, AdminResponse, Event, AdminRequest,
+    AdminRequest, AdminResponse, CommandRequest, CommandResponse, Event, LogEntry, LogRequest,
+    LogResponse, NodeID, RaftRequest, Role, VoteRequest, VoteResponse,
 };
 use crate::state::Storage;
 use crate::utils;
@@ -23,14 +23,13 @@ use self::config::{Config, InternalConfig};
 type SyncConnection = Sender<RaftRequest>;
 
 pub struct Node<S: Storage<String, String>> {
-    // stable
+    // must be stable storage
     pub id: NodeID,
     current_term: usize,
     voted_for: Option<NodeID>,
     log: Vec<LogEntry>,
     commit_length: usize,
 
-    // memory
     current_role: Role,
     current_leader: Option<NodeID>,
     votes_received: HashSet<NodeID>,
@@ -44,6 +43,7 @@ pub struct Node<S: Storage<String, String>> {
     t_election_start: Instant,
     config: InternalConfig,
 
+    // clients waiting for event notifications
     waiting_events: HashMap<Event, Vec<SyncConnection>>,
 
     // outgoing requests and responses
@@ -115,7 +115,7 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     pub fn start(self) {
-        log::info!("{} starting", self.stamp());
+        log::info!("{} starting", self.info());
         self.event_loop();
     }
 
@@ -135,12 +135,15 @@ impl<S: Storage<String, String>> Node<S> {
                 // if shutdown takes longer, we may notify early
                 thread::sleep(Duration::from_millis(1000));
 
-                self.notify_send(Event::ShutdownCompleted, RaftRequest::AdminResponse(AdminResponse::Done));
+                self.notify(
+                    Event::ShutdownCompleted,
+                    RaftRequest::AdminResponse(AdminResponse::Done),
+                );
 
                 // here we close outgoing, which does stop outbox.
                 // note this happens after we notify, because we can't notify after dropping self.
                 drop(self.outgoing);
-                
+
                 return;
             }
         }
@@ -149,7 +152,7 @@ impl<S: Storage<String, String>> Node<S> {
     fn follower(&mut self) {
         // check for heartbeat timeout
         if Instant::now() > self.t_heartbeat_received + self.election_timeout {
-            log::warn!("{} has not received heartbeat since \n\t(last: {:?}, now: {:?}), \n\tbecoming candidate", self.stamp(), self.t_heartbeat_received, Instant::now());
+            log::warn!("{} has not received heartbeat since \n\t(last: {:?}, now: {:?}), \n\tbecoming candidate", self.info(), self.t_heartbeat_received, Instant::now());
             self.become_candidate();
         }
     }
@@ -159,7 +162,7 @@ impl<S: Storage<String, String>> Node<S> {
         if Instant::now() > self.t_election_start + self.election_timeout {
             log::warn!(
                 "{} election timeout reached \n\t(start: {:?}, now: {:?}), \n\trestarting election",
-                self.stamp(),
+                self.info(),
                 self.t_election_start,
                 Instant::now(),
             );
@@ -191,11 +194,9 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn become_leader(&mut self) {
-        info!("{} becoming leader", self.stamp());
+        info!("{} becoming leader", self.info());
         self.current_role = Role::Leader;
         self.current_leader = Some(self.id);
-
-        self.notify_send(Event::BecameLeader, RaftRequest::AdminResponse(AdminResponse::Done));
 
         // replicate logs to other nodes
         for follower in self.followers() {
@@ -219,19 +220,19 @@ impl<S: Storage<String, String>> Node<S> {
                 last_log_term: last_term,
             };
 
-            log::trace!("{} sending vote request to {}", self.stamp(), follower);
+            log::trace!("{} sending vote request to {}", self.info(), follower);
             self.outgoing.send((RaftRequest::VoteRequest(request), follower)).unwrap();
         }
     }
 
     fn receive_vote_request(&mut self, request: VoteRequest) -> VoteResponse {
-        log::trace!("{} received vote request from Node {}", self.stamp(), request.sender);
+        log::trace!("{} received vote request from Node {}", self.info(), request.sender);
 
         // if we see a higher term, step down
         if request.term > self.current_term {
             log::warn!(
                 "{} Found higher term: current_term = {} but node {} had term {}",
-                self.stamp(),
+                self.info(),
                 self.current_term,
                 request.sender,
                 request.term
@@ -251,7 +252,7 @@ impl<S: Storage<String, String>> Node<S> {
 
         // if the requestors term is current, log is healthy, and we haven't voted yet, vote yes
         if request.term == self.current_term && log_ok && self.voted_for == None {
-            log::info!("{} voting for Node {}", self.stamp(), request.sender);
+            log::info!("{} voting for Node {}", self.info(), request.sender);
             self.voted_for = Some(request.sender);
 
             return VoteResponse { sender: self.id, term: self.current_term, granted: true };
@@ -261,13 +262,13 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn receive_vote_response(&mut self, response: VoteResponse) {
-        log::trace!("{} received vote response from Node {}", self.stamp(), response.sender);
+        log::trace!("{} received vote response from Node {}", self.info(), response.sender);
 
         // check for higher term on vote response;
         if response.term > self.current_term {
             log::warn!(
                 "{} Stepping down. received a vote response with a higher term {} vs {}",
-                self.stamp(),
+                self.info(),
                 response.term,
                 self.current_term
             );
@@ -279,7 +280,7 @@ impl<S: Storage<String, String>> Node<S> {
             && response.term == self.current_term
             && response.granted
         {
-            log::info!("{} received granted vote from {}", self.stamp(), response.sender);
+            log::info!("{} received granted vote from {}", self.info(), response.sender);
 
             self.votes_received.insert(response.sender);
 
@@ -287,7 +288,7 @@ impl<S: Storage<String, String>> Node<S> {
             if self.votes_received.len() > self.config.cluster.len() / 2 {
                 log::info!(
                     "{} ****** received a quorum with {} votes ******",
-                    self.stamp(),
+                    self.info(),
                     self.votes_received.len()
                 );
 
@@ -298,7 +299,7 @@ impl<S: Storage<String, String>> Node<S> {
 
     fn broadcast_request(&mut self, message: CommandRequest, client: SyncConnection) {
         if self.current_role == Role::Leader {
-            log::trace!("{} received broadcast request as leader", self.stamp());
+            log::trace!("{} received broadcast request as leader", self.info());
             self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
@@ -307,7 +308,6 @@ impl<S: Storage<String, String>> Node<S> {
             }
 
             self.subscribe(Event::CommittedLog(self.log.len() - 1), client);
-
         } else {
             // forward to leader or return Unavailable
             let response = match self.current_leader {
@@ -377,7 +377,7 @@ impl<S: Storage<String, String>> Node<S> {
             // if we short circuit on the && or ||, the call to self.log[request.prefix_lenth - 1] will panic
             log::warn!(
                 "{} rejecting log, log.len={}, prefix_len={}, log{:?}, prefix_term={}",
-                self.stamp(),
+                self.info(),
                 self.log.len(),
                 request.prefix_lenth,
                 &self.log,
@@ -406,11 +406,10 @@ impl<S: Storage<String, String>> Node<S> {
             // must truncate the log where they diverge.
             // this is fine because they are not committed.
             if self.log[index].term != suffix[index - prefix_len].term {
-                
                 if self.waiting_events.contains_key(&Event::CommittedLog(prefix_len - 1)) {
                     log::error!(
                         "{} truncated log {:?} with a waiting client!",
-                        self.stamp(),
+                        self.info(),
                         prefix_len - 1
                     );
                 }
@@ -450,16 +449,13 @@ impl<S: Storage<String, String>> Node<S> {
             } else if self.sent_length[&response.sender] > 0 {
                 log::warn!(
                     "{} follower failed to log: success={}, ack={} vs last ack={}",
-                    self.stamp(),
+                    self.info(),
                     response.success,
                     response.ack,
                     self.acked_length[&response.sender]
                 );
 
                 // if send fails, maybe gap in follower log.
-                // decrement to try and shrink prefix, sending one more log
-                // on next attempt.
-                // if gap is large, this could take many iterations. (can be optimized)
                 *self.sent_length.get_mut(&response.sender).unwrap() -= 1;
                 self.replicate_log(response.sender);
             }
@@ -483,13 +479,16 @@ impl<S: Storage<String, String>> Node<S> {
 
             // check for quorum
             if acks > self.config.cluster.len() / 2 {
-                log::info!("{} leader committing log {}", self.stamp(), self.commit_length);
+                log::info!("{} leader committing log {}", self.info(), self.commit_length);
                 let result = self
                     .state
                     .apply_command(self.log[self.commit_length].command.clone())
                     .expect("err applying command");
-                
-                self.notify_send(Event::CommittedLog(self.commit_length), RaftRequest::CommandResponse(CommandResponse::Result(result)));
+
+                self.notify(
+                    Event::CommittedLog(self.commit_length),
+                    RaftRequest::CommandResponse(CommandResponse::Result(result)),
+                );
 
                 self.commit_length += 1;
             } else {
@@ -505,7 +504,7 @@ impl<S: Storage<String, String>> Node<S> {
                     self.broadcast_request(request, client.unwrap());
                 }
                 RaftRequest::CommandResponse(response) => {
-                    log::error!("{} received a command response! {response:?}", self.stamp());
+                    log::error!("{} received a command response! {response:?}", self.info());
                 }
                 RaftRequest::LogRequest(request) => {
                     let from = request.sender;
@@ -527,8 +526,11 @@ impl<S: Storage<String, String>> Node<S> {
                     self.receive_admin_request(request, client.unwrap());
                 }
                 RaftRequest::AdminResponse(response) => {
-                    log::error!("{} recieved an admin response as a node: {response:?}", self.stamp());
-                },
+                    log::error!(
+                        "{} recieved an admin response as a node: {response:?}",
+                        self.info()
+                    );
+                }
             }
         }
 
@@ -536,7 +538,7 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     fn receive_admin_request(&mut self, request: AdminRequest, client: SyncConnection) {
-        log::warn!("{} received admin request: {request:?}", self.stamp());
+        log::warn!("{} received admin request: {request:?}", self.info());
 
         match request {
             AdminRequest::Shutdown => {
@@ -545,30 +547,40 @@ impl<S: Storage<String, String>> Node<S> {
                 self.shutdown = true
             }
             AdminRequest::BecomeLeader => {
-                self.subscribe(Event::BecameLeader, client);
                 self.current_term += 1;
                 self.become_leader();
+                client.send(RaftRequest::AdminResponse(AdminResponse::Done)).unwrap();
             }
-            AdminRequest::BecomeFollower => self.become_follower(self.current_term),
-            AdminRequest::BecomeCandidate => self.become_candidate(),
-            AdminRequest::GetLeader => todo!(),
-            AdminRequest::GetLogLength => todo!(),
-            AdminRequest::GetTerm => todo!(),
+            AdminRequest::BecomeFollower => {
+                self.become_follower(self.current_term);
+                client.send(RaftRequest::AdminResponse(AdminResponse::Done)).unwrap();
+            }
+            AdminRequest::BecomeCandidate => {
+                self.become_candidate();
+                client.send(RaftRequest::AdminResponse(AdminResponse::Done)).unwrap();
+            }
+            AdminRequest::GetLeader => {
+                client
+                    .send(RaftRequest::AdminResponse(AdminResponse::Leader(self.current_leader)))
+                    .unwrap();
+            }
+            AdminRequest::GetLogLength => {
+                client
+                    .send(RaftRequest::AdminResponse(AdminResponse::LogLength(self.log.len())))
+                    .unwrap();
+            },
+            AdminRequest::GetTerm => {
+                client
+                    .send(RaftRequest::AdminResponse(AdminResponse::Term(self.current_term)))
+                    .unwrap();
+            },
         }
     }
 
-    fn notify<F: Fn(SyncConnection)>(&mut self, event: Event, notify: F) {
+    fn notify(&mut self, event: Event, notification: RaftRequest) {
         if let Some(conns) = self.waiting_events.remove(&event) {
             for conn in conns {
-                notify(conn);
-            }
-        }
-    }
-
-    fn notify_send(&mut self, event: Event, send: RaftRequest) {
-        if let Some(conns) = self.waiting_events.remove(&event) {
-            for conn in conns {
-                conn.send(send.clone()).unwrap();
+                conn.send(notification.clone()).unwrap();
             }
         }
     }
@@ -583,7 +595,7 @@ impl<S: Storage<String, String>> Node<S> {
     }
 
     #[inline]
-    fn stamp(&self) -> String {
+    fn info(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }
 }

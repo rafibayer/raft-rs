@@ -96,7 +96,7 @@ pub enum AdminResponse {
     Done,
     
     // query admin request responses
-    Leader(NodeID),
+    Leader(Option<NodeID>),
     LogLength(usize),
     Term(usize),
 }
