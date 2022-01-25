@@ -45,18 +45,16 @@ fn main() {
     thread::sleep(Duration::from_secs(2));
 
 
-    log::warn!("***************** SHUTDOWN: 0 *****************");
-    admin(AdminRequest::Shutdown, cluster[&0]);
-
+    log::warn!("***************** FOLLOWER: 0 *****************");
+    admin(AdminRequest::BecomeFollower, cluster[&0]);
     
-    thread::sleep(Duration::from_secs(25));
 
     log::warn!("***************** SENDING *****************");
     let mut handles = Vec::new();
     for thread in 0..1 {
         let cluster_clone = cluster.clone();
         handles.push(thread::spawn(move || {
-            for i in 1..=1000 {
+            for i in 1..=100 {
                 let x_val = i * (thread + 1);
                 async_tcp::apply_command(
                     CommandRequest { command: format!("SET X {x_val}") },
@@ -74,11 +72,11 @@ fn main() {
 
     log::warn!("***************** VERIFYING *****************");
     let result =
-        async_tcp::apply_command(CommandRequest { command: "GET X".to_string() }, 0, &cluster)
+        async_tcp::apply_command(CommandRequest { command: "GET X".to_string() }, 1, &cluster)
             .unwrap();
 
     println!("======= result: {result} =======");
 
     log::warn!("***************** TERMINATING *****************");
-    thread::sleep(Duration::from_secs(5));
+    thread::sleep(Duration::from_secs(3));
 }

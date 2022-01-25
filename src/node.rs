@@ -58,18 +58,22 @@ pub struct Node<S: Storage<String, String>> {
     state: S,
 
     shutdown: bool,
+    sig_shutdown: Sender<()>,
 }
 
 impl<S: Storage<String, String>> Node<S> {
     pub fn new(id: usize, nodes: HashMap<NodeID, SocketAddr>, state: S) -> Self {
+        let (tx_shutdown, rx_shutdown) = mpsc::channel();
+
         let (tx_outgoing, rx_outgoing) = mpsc::channel();
         let (tx_incoming, rx_incoming) = mpsc::channel();
 
+        
         let address = nodes[&id];
         thread::spawn(move || {
             // will send incoming requests to tx_incoming.
             // node will get them from incoming: rx_incoming
-            inbox_thread(id, address, tx_incoming);
+            inbox_thread(id, address, tx_incoming, rx_shutdown);
         });
 
         let node_clone = nodes.clone();
@@ -107,7 +111,8 @@ impl<S: Storage<String, String>> Node<S> {
 
             state,
 
-            shutdown: false
+            shutdown: false,
+            sig_shutdown: tx_shutdown,
         }
     }
 
@@ -127,13 +132,11 @@ impl<S: Storage<String, String>> Node<S> {
             };
 
             if self.shutdown {
-                // this isn't enough, dropping channels doesn't stop the threads.
 
                 // here we close outgoing, which does stop outbox
                 drop(self.outgoing);
 
-                // TcpListener is still handling connections, but nobody is answering
-                drop(self.incoming);
+                self.sig_shutdown.send(()).unwrap();
 
                 return;
             }
@@ -548,6 +551,4 @@ impl<S: Storage<String, String>> Node<S> {
     fn stamp(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)
     }
-
-    
 }
