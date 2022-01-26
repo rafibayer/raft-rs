@@ -57,35 +57,15 @@ fn handle_connection(
         let msg = tcp::read(&mut stream)?;
         match msg {
             // client commands must be answered sync
-            RaftRequest::CommandRequest(_) => {
+            RaftRequest::CommandRequest(_) | RaftRequest::AdminRequest(_) => {
                 let (tx, rx) = mpsc::channel();
                 incoming.send((msg, Some(tx)))?;
                 let response = rx.recv()?;
-                if let RaftRequest::CommandResponse(response) = response {
-                    tcp::send(&RaftRequest::CommandResponse(response), &mut stream)?;
-                    drop(stream);
+                tcp::send(&response, &mut stream)?;
+                drop(stream);
 
-                    // we don't keep client connections open, we can therefore return this thread.
-                    return Ok(());
-                }
-
-                log::error!("Command request received an unexpected response type: {response:?}");
-            }
-            // admin commands must be answered sync
-            RaftRequest::AdminRequest(_) => {
-                let (tx, rx) = mpsc::channel();
-                incoming.send((msg, Some(tx)))?;
-                let response = rx.recv()?;
-                if let RaftRequest::AdminResponse(response) = response {
-                    tcp::send(&RaftRequest::AdminResponse(response), &mut stream)?;
-                    drop(stream);
-
-                    // we don't keep client connections open, we can therefore return this thread.
-                    return Ok(());
-                }
-
-                log::error!("Admin request received an unexpected response type: {response:?}");
-
+                // we don't keep client connections open, we can therefore return this thread.
+                return Ok(());
             }
             _ => incoming.send((msg, None))?,
         };
@@ -97,21 +77,31 @@ pub fn outbox_thread(
     outgoing: Receiver<(RaftRequest, NodeID)>,
     nodes: HashMap<NodeID, SocketAddr>,
 ) {
-    let mut connections = nodes
-        .into_iter()
-        .map(|(node, addr)| (node, TcpStream::connect(addr).unwrap()))
-        .collect::<HashMap<NodeID, TcpStream>>();
+    let mut connections = HashMap::new();
 
     for (req, node) in outgoing.into_iter() {
         assert_ne!(node, id);
 
-        // todo: if this fails bc of connection we need to reconnect instead of hammering
-        // this closed stream. need some logic to remove connection/reconnect
-        let stream = connections.get_mut(&node).unwrap();
-        if let Err(err) = tcp::send(&req, stream) {
-            log::trace!("Node {id} outbox: Error sending message to {node}: {err:?}");
+        match get_conn(node, &nodes, &mut connections) {
+            Ok(stream) => {
+                if let Err(err) = tcp::send(&req, stream) {
+                    log::trace!("Node {id} outbox: Error sending message to {node}: {err:?}");
+                    connections.remove(&node); // will force us to reconnect next iteration
+                }
+            }
+            Err(err) => log::warn!("{id} failed to connect to {node}: {err:?}"),
         }
     }
 
     log::error!("Node {id}: outbox thread terminating!!!");
+}
+
+fn get_conn<'a>(node: NodeID, addrs: &HashMap<NodeID, SocketAddr>, conns: &'a mut HashMap<NodeID, TcpStream>) -> Result<&'a mut TcpStream, Box<dyn Error>> {
+    match conns.contains_key(&node) {
+        true => conns.get_mut(&node).ok_or_else(|| panic!()),
+        false => {
+            conns.insert(node, tcp::connect_with_retries(addrs[&node], Duration::from_millis(100), 3)?);
+            conns.get_mut(&node).ok_or_else(|| panic!())
+        },
+    }
 }

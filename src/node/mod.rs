@@ -4,7 +4,7 @@ pub mod config;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{error, thread};
 
 use log::info;
@@ -151,27 +151,22 @@ impl<S: Storage<String, String>> Node<S> {
 
     fn follower(&mut self) {
         // check for heartbeat timeout
-        if Instant::now() > self.t_heartbeat_received + self.election_timeout {
-            log::warn!("{} has not received heartbeat since \n\t(last: {:?}, now: {:?}), \n\tbecoming candidate", self.info(), self.t_heartbeat_received, Instant::now());
+        if self.t_heartbeat_received.elapsed() > self.election_timeout {
+            log::warn!("{} has not received heartbeat in {:?}, becoming candidate", self.info(), self.t_heartbeat_received.elapsed());
             self.become_candidate();
         }
     }
 
     fn candidate(&mut self) {
         // check for election timeout
-        if Instant::now() > self.t_election_start + self.election_timeout {
-            log::warn!(
-                "{} election timeout reached \n\t(start: {:?}, now: {:?}), \n\trestarting election",
-                self.info(),
-                self.t_election_start,
-                Instant::now(),
-            );
+        if self.t_election_start.elapsed() > self.election_timeout {
+            log::warn!("{} election timed out after {:?}, restarting election", self.info(), self.t_election_start.elapsed());
             self.become_candidate();
         }
     }
 
     fn leader(&mut self) {
-        if Instant::now() > self.t_heartbeat_sent + self.config.heartbeat_interval {
+        if self.t_heartbeat_sent.elapsed() > self.config.heartbeat_interval {
             self.send_heartbeat();
         }
     }
@@ -184,11 +179,14 @@ impl<S: Storage<String, String>> Node<S> {
 
     fn become_candidate(&mut self) {
         self.current_role = Role::Candidate;
-        self.voted_for = Some(self.id);
         self.current_term += 1;
+
+        self.voted_for = Some(self.id);
         self.votes_received.clear();
         self.votes_received.insert(self.id);
+        
         self.t_election_start = Instant::now();
+        self.election_timeout = utils::rand_duration(self.config.election_timeout_range.clone());
 
         self.request_votes();
     }
@@ -199,7 +197,7 @@ impl<S: Storage<String, String>> Node<S> {
         self.current_leader = Some(self.id);
 
         // replicate logs to other nodes
-        for follower in self.followers() {
+        for follower in self.peers() {
             self.sent_length.insert(follower, self.log.len());
             self.acked_length.insert(follower, 0);
             self.replicate_log(follower);
@@ -212,7 +210,7 @@ impl<S: Storage<String, String>> Node<S> {
             last_term = self.log[self.log.len() - 1].term;
         }
 
-        for follower in self.followers() {
+        for follower in self.peers() {
             let request = VoteRequest {
                 sender: self.id,
                 term: self.current_term,
@@ -258,6 +256,7 @@ impl<S: Storage<String, String>> Node<S> {
             return VoteResponse { sender: self.id, term: self.current_term, granted: true };
         }
 
+        log::warn!("{} not voting for Node {}", self.info(), request.sender);
         VoteResponse { sender: self.id, term: self.current_term, granted: false }
     }
 
@@ -303,13 +302,13 @@ impl<S: Storage<String, String>> Node<S> {
             self.log.push(LogEntry { command: message.command, term: self.current_term });
             self.acked_length.insert(self.id, self.log.len());
 
-            for follower in self.followers() {
+            for follower in self.peers() {
                 self.replicate_log(follower);
             }
 
             self.subscribe(Event::CommittedLog(self.log.len() - 1), client);
         } else {
-            // forward to leader or return Unavailable
+            // reply with NotLeader or Unavailable
             let response = match self.current_leader {
                 Some(leader) => CommandResponse::NotLeader(leader),
                 None => CommandResponse::Unavailable,
@@ -321,7 +320,7 @@ impl<S: Storage<String, String>> Node<S> {
     fn send_heartbeat(&mut self) {
         self.t_heartbeat_sent = Instant::now();
 
-        for follower in self.followers() {
+        for follower in self.peers() {
             self.replicate_log(follower);
         }
     }
@@ -497,7 +496,10 @@ impl<S: Storage<String, String>> Node<S> {
         }
     }
 
+    /// process the next incoming message.
+    /// Messages may come from clients, or other nodes in the cluster.
     fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
+
         if let Ok((message, client)) = self.incoming.try_recv() {
             match message {
                 RaftRequest::CommandRequest(request) => {
@@ -537,12 +539,14 @@ impl<S: Storage<String, String>> Node<S> {
         Ok(())
     }
 
+    /// Processes an admin request from a given client
     fn receive_admin_request(&mut self, request: AdminRequest, client: SyncConnection) {
         log::warn!("{} received admin request: {request:?}", self.info());
-
         match request {
             AdminRequest::Shutdown => {
+                // shutdown must happen in the event_loop, so we subscribe the client here.
                 self.subscribe(Event::ShutdownCompleted, client);
+
                 // shutdown will begin next iteration of the event loop
                 self.shutdown = true
             }
@@ -577,6 +581,13 @@ impl<S: Storage<String, String>> Node<S> {
         }
     }
 
+    /// subscribes a connection to an event
+    fn subscribe(&mut self, event: Event, conn: SyncConnection) {
+        self.waiting_events.entry(event).or_insert_with(Vec::new).push(conn);
+    }
+
+    /// sends a notification to all subscribes for an event,
+    /// unsubscribing them.
     fn notify(&mut self, event: Event, notification: RaftRequest) {
         if let Some(conns) = self.waiting_events.remove(&event) {
             for conn in conns {
@@ -585,15 +596,14 @@ impl<S: Storage<String, String>> Node<S> {
         }
     }
 
-    fn subscribe(&mut self, event: Event, conn: SyncConnection) {
-        self.waiting_events.entry(event).or_insert(vec![]).push(conn);
-    }
-
+    /// Returns a Vec<NodeID> containing the NodeID for every node in the cluster
+    /// except self.
     #[inline]
-    fn followers(&self) -> Vec<NodeID> {
+    fn peers(&self) -> Vec<NodeID> {
         self.config.cluster.keys().cloned().filter(|k| *k != self.id).collect()
     }
 
+    /// Returns a nicely-formatted info string about this node
     #[inline]
     fn info(&self) -> String {
         format!("[Node {} | Term {} | {:?}]", self.id, self.current_term, self.current_role)

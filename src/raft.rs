@@ -37,6 +37,17 @@ pub struct CommandRequest {
     pub command: String,
 }
 
+/// potential optimization:
+/// for writes, we obviously need to replicate to each node
+/// for reads, we need to send a heartbeat to ensure we are leader, but command can be empty (save mem/time)
+/// for dirty reads, we can just respond immediately from leader, without adding to log
+// #[derive(Debug, Serialize, Deserialize, Clone)]
+// pub enum CommandOptions {
+//     Write,
+//     Read,
+//     DirtyRead,
+// }
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CommandResponse {
     Result(String),
@@ -90,7 +101,7 @@ pub enum AdminRequest {
     GetTerm,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum AdminResponse {
     /// generic "Done" response for admin action
     Done,

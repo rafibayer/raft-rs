@@ -2,7 +2,7 @@ use std::thread;
 use std::{thread::JoinHandle, collections::HashMap};
 
 use crate::node::Node;
-use crate::node::config::Config;
+use crate::node::config::{Config, LogLevel};
 
 use crate::networking::client::Client;
 
@@ -29,6 +29,7 @@ pub(crate) fn create_local_cluster(nodes: usize, start_port: usize) -> (Client, 
         election_timeout_min_ms: 150,
         election_timeout_max_ms: 350,
         heartbeat_interval_ms: 50,
+        log_level: LogLevel::Off,
     };
 
     let mut handles = Vec::new();

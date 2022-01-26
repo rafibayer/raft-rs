@@ -7,9 +7,9 @@ mod utils;
 #[cfg(test)]
 mod test;
 
-use std::{collections::HashMap, thread, time::Duration};
+use std::{collections::HashMap, thread, time::Duration, fs};
 
-use raft::CommandRequest;
+use raft::{CommandRequest, NodeID};
 
 use simple_logger::SimpleLogger;
 
@@ -17,56 +17,24 @@ use node::Node;
 
 use crate::{networking::client::Client, raft::AdminRequest, node::config::Config};
 
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    #[clap(short, long)]
+    node: NodeID,
+
+    #[clap(short, long)]
+    config: String,
+}
+
 fn main() {
-    SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
+    let args = Args::parse();
+    let config = serde_json::from_str::<Config>(&fs::read_to_string(args.config).unwrap()).unwrap();
+    SimpleLogger::new().with_level(config.log_level.into()).init().unwrap();
 
-    let port = 7878;
-    let n = 5;
+    let node = Node::new(args.node, config, HashMap::new());
 
-    let mut cluster = HashMap::new();
-
-    for i in 0..n {
-        cluster.insert(i, format!("127.0.0.1:{}", port + i).parse().unwrap());
-    }
-
-    let mut client = Client::new(cluster.clone());
-
-    let config = Config {
-        cluster,
-        election_timeout_min_ms: 150,
-        election_timeout_max_ms: 350,
-        heartbeat_interval_ms: 50,
-    };
-
-    for i in 0..n {
-        let config = config.clone();
-        thread::spawn(move || {
-            let node = Node::new(i, config, HashMap::new());
-            node.start();
-        });
-    }
-
-    thread::sleep(Duration::from_secs(2));
-
-    log::warn!("***************** BECOME LEADER: 0 *****************");
-    let res = client.admin(0, AdminRequest::BecomeLeader).unwrap();
-    log::info!("Admin response: {res:?}");
-
-    log::warn!("***************** SHUTDOWN: 0 *****************");
-    let res = client.admin(0, AdminRequest::Shutdown).unwrap();
-    log::info!("Admin response: {res:?}");
-
-    log::warn!("***************** SENDING *****************");
-    for i in 1..=100 {
-        let x_val = i;
-        client.apply_command(CommandRequest { command: format!("SET X {x_val}") }).unwrap();
-    }
-
-    log::warn!("***************** VERIFYING *****************");
-    let result = client.apply_command(CommandRequest { command: "GET X".to_string() }).unwrap();
-
-    println!("======= result: {result:?} =======");
-
-    log::warn!("***************** TERMINATING *****************");
-    thread::sleep(Duration::from_secs(3));
+    node.start();
 }

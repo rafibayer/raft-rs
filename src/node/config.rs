@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::{SocketAddr}, time::Duration};
 
+use log::LevelFilter;
 use serde::{Deserialize, Serialize};
 
 use crate::raft::NodeID;
@@ -12,6 +13,30 @@ pub struct Config {
     pub election_timeout_max_ms: u64,
 
     pub heartbeat_interval_ms: u64,
+
+    pub log_level: LogLevel
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Copy)]
+pub enum LogLevel {
+    Off,
+    Trace,
+    Info,
+    Warn,
+    Error
+}
+
+impl From<LogLevel> for LevelFilter {
+    
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => LevelFilter::Off,
+            LogLevel::Trace => LevelFilter::Trace,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Warn => LevelFilter::Warn,
+            LogLevel::Error => LevelFilter::Error,
+        }
+    }
 }
 
 impl Default for Config {
@@ -21,6 +46,7 @@ impl Default for Config {
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 350,
             heartbeat_interval_ms: 50,
+            log_level: LogLevel::Info
         }
     }
 }
