@@ -5,9 +5,9 @@ use std::{
     time::Duration,
 };
 
-use crate::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse};
+use core::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse};
 
-use super::tcp;
+use core::networking::tcp;
 
 pub struct Client {
     cached_leader: Option<NodeID>,
@@ -48,7 +48,7 @@ impl Client {
         if let RaftRequest::CommandResponse(response) = response {
             return match response {
                 CommandResponse::Result(_) => Ok(response),
-                crate::raft::CommandResponse::NotLeader(leader) => {
+                CommandResponse::NotLeader(leader) => {
                     log::info!("Client received NotLeader, trying leader: {leader}");
                     self.cached_leader = Some(leader);
                     return self.apply_command(command);

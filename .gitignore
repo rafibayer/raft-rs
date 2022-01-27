@@ -1,2 +1,3 @@
 /target
 main2.rs
+client_data/*.json

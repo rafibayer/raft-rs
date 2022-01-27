@@ -1,21 +1,12 @@
-mod networking;
-mod node;
-mod raft;
-mod state;
-mod utils;
+use std::{collections::HashMap, fs};
 
-#[cfg(test)]
-mod test;
-
-use std::{collections::HashMap, thread, time::Duration, fs};
-
-use raft::{CommandRequest, NodeID};
+use core::raft::NodeID;
 
 use simple_logger::SimpleLogger;
 
-use node::Node;
+use core::node::Node;
 
-use crate::{networking::client::Client, raft::AdminRequest, node::config::Config};
+use core::node::config::Config;
 
 use clap::Parser;
 
