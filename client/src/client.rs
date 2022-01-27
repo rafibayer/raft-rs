@@ -5,9 +5,11 @@ use std::{
     time::Duration,
 };
 
-use core::raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse};
+use core::{raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse}, utils::RetryOptions};
 
 use core::networking::tcp;
+
+const CLIENT_RETRY: &'static RetryOptions = &RetryOptions { attempts: 3, delay: Duration::from_millis(500) };
 
 pub struct Client {
     cached_leader: Option<NodeID>,
@@ -28,9 +30,8 @@ impl Client {
                 log::trace!("Client trying to connect to cached leader: {leader}");
                 let stream = tcp::connect_with_retries(
                     self.cluster[&leader],
-                    Duration::from_millis(100),
-                    3,
-                );
+                    CLIENT_RETRY);
+
                 match stream {
                     Ok(stream) => stream,
                     Err(_) => {
@@ -63,7 +64,7 @@ impl Client {
 
     pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<AdminResponse, Box<dyn error::Error>> {
         let mut stream =
-            tcp::connect_with_retries(self.cluster[&node], Duration::from_millis(100), 10)?;
+            tcp::connect_with_retries(self.cluster[&node], CLIENT_RETRY)?;
 
         tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
         let response = tcp::read(&mut stream)?;
@@ -75,12 +76,12 @@ impl Client {
 
     fn connect_to_any_node(&self) -> Result<TcpStream, Box<dyn error::Error>> {
         for (node, address) in &self.cluster {
-            let conn = tcp::connect_with_retries(*address, Duration::from_millis(50), 2);
+            let conn = tcp::connect_with_retries(*address, CLIENT_RETRY);
             if let Ok(conn) = conn {
                 return Ok(conn);
             }
 
-            log::warn!("Client failed to connect to {node} after 2 attempts!");
+            log::warn!("Client failed to connect to {node} after 3 attempts!");
         }
 
         Err("Could not connect to any node".to_string().into())

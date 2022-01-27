@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::raft::RaftRequest;
+use crate::{
+    raft::RaftRequest,
+    utils::{self, RetryOptions},
+};
 
 pub fn send(request: &RaftRequest, stream: &mut TcpStream) -> Result<(), Box<dyn Error>> {
     let serialized = bincode::serialize(&request)?;
@@ -34,20 +37,8 @@ pub fn read(stream: &mut TcpStream) -> Result<RaftRequest, Box<dyn Error>> {
 
 pub fn connect_with_retries(
     address: SocketAddr,
-    delay: Duration,
-    attempts: usize,
+    options: &RetryOptions,
 ) -> Result<TcpStream, String> {
-    for i in 0..attempts {
-        if let Ok(stream) = TcpStream::connect(address) {
-            return Ok(stream);
-        }
-
-        log::warn!(
-            "failed to connect to {address:?} after {} attemps. Retrying in {delay:?}",
-            i + 1
-        );
-        thread::sleep(delay);
-    }
-
-    Err(format!("Failed to connect to {address:?} after {attempts} attempts"))
+    utils::retry(|| TcpStream::connect(address), options)
+        .or_else(|_| Err(format!("Failed to connect to {address:?}")))
 }

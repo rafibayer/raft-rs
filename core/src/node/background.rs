@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     networking::tcp,
-    raft::{NodeID, RaftRequest},
+    raft::{NodeID, RaftRequest}, utils::RetryOptions,
 };
 
 use super::SyncConnection;
@@ -100,7 +100,10 @@ fn get_conn<'a>(node: NodeID, addrs: &HashMap<NodeID, SocketAddr>, conns: &'a mu
     match conns.contains_key(&node) {
         true => conns.get_mut(&node).ok_or_else(|| panic!()),
         false => {
-            conns.insert(node, tcp::connect_with_retries(addrs[&node], Duration::from_millis(100), 3)?);
+            conns.insert(node, tcp::connect_with_retries(addrs[&node], &RetryOptions {
+                attempts: 3,
+                delay: Duration::from_millis(50),
+            })?);
             conns.get_mut(&node).ok_or_else(|| panic!())
         },
     }
