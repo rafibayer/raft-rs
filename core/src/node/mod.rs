@@ -4,7 +4,7 @@ pub mod config;
 use std::cmp::min;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 use std::{error, thread};
 
 use log::info;
@@ -152,7 +152,11 @@ impl<S: Storage<String, String>> Node<S> {
     fn follower(&mut self) {
         // check for heartbeat timeout
         if self.t_heartbeat_received.elapsed() > self.election_timeout {
-            log::warn!("{} has not received heartbeat in {:?}, becoming candidate", self.info(), self.t_heartbeat_received.elapsed());
+            log::warn!(
+                "{} has not received heartbeat in {:?}, becoming candidate",
+                self.info(),
+                self.t_heartbeat_received.elapsed()
+            );
             self.become_candidate();
         }
     }
@@ -160,7 +164,11 @@ impl<S: Storage<String, String>> Node<S> {
     fn candidate(&mut self) {
         // check for election timeout
         if self.t_election_start.elapsed() > self.election_timeout {
-            log::warn!("{} election timed out after {:?}, restarting election", self.info(), self.t_election_start.elapsed());
+            log::warn!(
+                "{} election timed out after {:?}, restarting election",
+                self.info(),
+                self.t_election_start.elapsed()
+            );
             self.become_candidate();
         }
     }
@@ -184,7 +192,7 @@ impl<S: Storage<String, String>> Node<S> {
         self.voted_for = Some(self.id);
         self.votes_received.clear();
         self.votes_received.insert(self.id);
-        
+
         self.t_election_start = Instant::now();
         self.election_timeout = utils::rand_duration(self.config.election_timeout_range.clone());
 
@@ -499,7 +507,6 @@ impl<S: Storage<String, String>> Node<S> {
     /// process the next incoming message.
     /// Messages may come from clients, or other nodes in the cluster.
     fn process_message(&mut self) -> Result<(), Box<dyn error::Error>> {
-
         if let Ok((message, client)) = self.incoming.try_recv() {
             match message {
                 RaftRequest::CommandRequest(request) => {
@@ -572,12 +579,12 @@ impl<S: Storage<String, String>> Node<S> {
                 client
                     .send(RaftRequest::AdminResponse(AdminResponse::LogLength(self.log.len())))
                     .unwrap();
-            },
+            }
             AdminRequest::GetTerm => {
                 client
                     .send(RaftRequest::AdminResponse(AdminResponse::Term(self.current_term)))
                     .unwrap();
-            },
+            }
         }
     }
 

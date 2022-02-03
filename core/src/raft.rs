@@ -105,13 +105,12 @@ pub enum AdminRequest {
 pub enum AdminResponse {
     /// generic "Done" response for admin action
     Done,
-    
+
     // query admin request responses
     Leader(Option<NodeID>),
     LogLength(usize),
     Term(usize),
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum Event {

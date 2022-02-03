@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::{SocketAddr}, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use log::LevelFilter;
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ pub struct Config {
 
     pub heartbeat_interval_ms: u64,
 
-    pub log_level: LogLevel
+    pub log_level: LogLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Copy)]
@@ -23,11 +23,10 @@ pub enum LogLevel {
     Trace,
     Info,
     Warn,
-    Error
+    Error,
 }
 
 impl From<LogLevel> for LevelFilter {
-    
     fn from(level: LogLevel) -> Self {
         match level {
             LogLevel::Off => LevelFilter::Off,
@@ -46,7 +45,7 @@ impl Default for Config {
             election_timeout_min_ms: 150,
             election_timeout_max_ms: 350,
             heartbeat_interval_ms: 50,
-            log_level: LogLevel::Info
+            log_level: LogLevel::Info,
         }
     }
 }
@@ -61,7 +60,8 @@ impl From<Config> for InternalConfig {
     fn from(cfg: Config) -> Self {
         InternalConfig {
             cluster: cfg.cluster,
-            election_timeout_range: Duration::from_millis(cfg.election_timeout_min_ms)..=Duration::from_millis(cfg.election_timeout_max_ms),
+            election_timeout_range: Duration::from_millis(cfg.election_timeout_min_ms)
+                ..=Duration::from_millis(cfg.election_timeout_max_ms),
             heartbeat_interval: Duration::from_millis(cfg.heartbeat_interval_ms),
         }
     }

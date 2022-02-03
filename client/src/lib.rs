@@ -5,11 +5,15 @@ use std::{
     time::Duration,
 };
 
-use core::{raft::{AdminRequest, CommandRequest, CommandResponse, NodeID, RaftRequest, AdminResponse}, utils::RetryOptions};
+use core::{
+    raft::{AdminRequest, AdminResponse, CommandRequest, CommandResponse, NodeID, RaftRequest},
+    utils::RetryOptions,
+};
 
 use core::networking::tcp;
 
-const CLIENT_RETRY: &'static RetryOptions = &RetryOptions { attempts: 3, delay: Duration::from_millis(500) };
+const CLIENT_RETRY: &'static RetryOptions =
+    &RetryOptions { attempts: 3, delay: Duration::from_millis(500) };
 
 pub struct Client {
     cached_leader: Option<NodeID>,
@@ -28,16 +32,14 @@ impl Client {
         let mut stream = match self.cached_leader {
             Some(leader) => {
                 log::trace!("Client trying to connect to cached leader: {leader}");
-                let stream = tcp::connect_with_retries(
-                    self.cluster[&leader],
-                    CLIENT_RETRY);
+                let stream = tcp::connect_with_retries(self.cluster[&leader], CLIENT_RETRY);
 
                 match stream {
                     Ok(stream) => stream,
                     Err(_) => {
                         self.cached_leader = None;
-                        self.connect_to_any_node()? 
-                    },
+                        self.connect_to_any_node()?
+                    }
                 }
             }
             None => self.connect_to_any_node()?,
@@ -62,15 +64,20 @@ impl Client {
         Err("Client receive an unexpected message type".into())
     }
 
-    pub fn admin(&self, node: NodeID, request: AdminRequest) -> Result<AdminResponse, Box<dyn error::Error>> {
-        let mut stream =
-            tcp::connect_with_retries(self.cluster[&node], CLIENT_RETRY)?;
+    pub fn admin(
+        &self,
+        node: NodeID,
+        request: AdminRequest,
+    ) -> Result<AdminResponse, Box<dyn error::Error>> {
+        let mut stream = tcp::connect_with_retries(self.cluster[&node], CLIENT_RETRY)?;
 
         tcp::send(&RaftRequest::AdminRequest(request), &mut stream)?;
         let response = tcp::read(&mut stream)?;
         match response {
             RaftRequest::AdminResponse(response) => Ok(response),
-            other => Err(format!("Received unexpected response to admin request: {other:?}").into())
+            other => {
+                Err(format!("Received unexpected response to admin request: {other:?}").into())
+            }
         }
     }
 

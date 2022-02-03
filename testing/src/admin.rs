@@ -1,9 +1,8 @@
-use crate::raft::RaftRequest;
+use core::raft::RaftRequest;
+use std::{sync::{Arc, Mutex}, time::Duration};
 
 /// PORT START: 5000
-
 use super::*;
-
 
 /// test that we can shut down a node
 #[test]
@@ -14,7 +13,7 @@ fn test_shutdown() {
 
     let done = Arc::new(Mutex::new(false));
     let done_clone = done.clone();
-    
+
     thread::spawn(move || {
         cluster.remove(0).join().unwrap();
         *done_clone.lock().unwrap() = true;
@@ -53,12 +52,8 @@ fn test_become_follower() {
     thread::sleep(Duration::from_secs(3));
 
     client.admin(0, AdminRequest::BecomeLeader).unwrap();
-    assert_eq!(
-        AdminResponse::Leader(Some(0)),
-        client.admin(0, AdminRequest::GetLeader).unwrap());
+    assert_eq!(AdminResponse::Leader(Some(0)), client.admin(0, AdminRequest::GetLeader).unwrap());
 
     client.admin(0, AdminRequest::BecomeFollower).unwrap();
-    assert_ne!(
-        AdminResponse::Leader(Some(0)),
-        client.admin(0, AdminRequest::GetLeader).unwrap());
+    assert_ne!(AdminResponse::Leader(Some(0)), client.admin(0, AdminRequest::GetLeader).unwrap());
 }

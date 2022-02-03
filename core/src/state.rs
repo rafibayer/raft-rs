@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-pub trait Storage<TCommand, TResult>: Sync + Send {
+pub trait Storage<TCommand, TResult>: Send {
     fn apply_command(&mut self, command: TCommand) -> Result<TResult, String>;
 }
 

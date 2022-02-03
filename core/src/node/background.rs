@@ -10,7 +10,8 @@ use std::{
 
 use crate::{
     networking::tcp,
-    raft::{NodeID, RaftRequest}, utils::RetryOptions,
+    raft::{NodeID, RaftRequest},
+    utils::RetryOptions,
 };
 
 use super::SyncConnection;
@@ -96,15 +97,22 @@ pub fn outbox_thread(
     log::error!("Node {id}: outbox thread terminating!!!");
 }
 
-fn get_conn<'a>(node: NodeID, addrs: &HashMap<NodeID, SocketAddr>, conns: &'a mut HashMap<NodeID, TcpStream>) -> Result<&'a mut TcpStream, Box<dyn Error>> {
+fn get_conn<'a>(
+    node: NodeID,
+    addrs: &HashMap<NodeID, SocketAddr>,
+    conns: &'a mut HashMap<NodeID, TcpStream>,
+) -> Result<&'a mut TcpStream, Box<dyn Error>> {
     match conns.contains_key(&node) {
         true => conns.get_mut(&node).ok_or_else(|| panic!()),
         false => {
-            conns.insert(node, tcp::connect_with_retries(addrs[&node], &RetryOptions {
-                attempts: 3,
-                delay: Duration::from_millis(50),
-            })?);
+            conns.insert(
+                node,
+                tcp::connect_with_retries(
+                    addrs[&node],
+                    &RetryOptions { attempts: 3, delay: Duration::from_millis(50) },
+                )?,
+            );
             conns.get_mut(&node).ok_or_else(|| panic!())
-        },
+        }
     }
 }

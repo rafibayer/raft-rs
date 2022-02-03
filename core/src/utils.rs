@@ -12,10 +12,13 @@ pub struct RetryOptions {
 }
 
 pub struct RetryError<E> {
-    pub inner: Vec<E>
+    pub inner: Vec<E>,
 }
 
-pub fn retry<F : Fn() -> Result<T, E>, T, E>(f: F, options: &RetryOptions) -> Result<T, RetryError<E>>  {
+pub fn retry<F: Fn() -> Result<T, E>, T, E>(
+    f: F,
+    options: &RetryOptions,
+) -> Result<T, RetryError<E>> {
     let mut inner = Vec::new();
     for _ in 0..options.attempts {
         match f() {

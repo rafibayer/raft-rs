@@ -1,26 +1,27 @@
 use std::thread;
-use std::{thread::JoinHandle, collections::HashMap};
+use std::{collections::HashMap, thread::JoinHandle};
 
-use crate::node::Node;
-use crate::node::config::{Config, LogLevel};
+use core::node::config::{Config, LogLevel};
+use core::node::Node;
+use core::raft::CommandRequest;
+use core::raft::{AdminRequest, AdminResponse};
 
-use crate::networking::client::Client;
+use std::sync;
 
-use std::{time::Duration, sync::{Arc, Mutex}};
+use client::Client;
 
-use crate::raft::{AdminRequest, AdminResponse};
-use crate::raft::CommandRequest;
-
-mod consensus;
 mod admin;
+mod consensus;
 
-
-pub(crate) fn create_local_cluster(nodes: usize, start_port: usize) -> (Client, Vec<JoinHandle<()>>) {
+pub(crate) fn create_local_cluster(
+    nodes: usize,
+    start_port: usize,
+) -> (Client, Vec<JoinHandle<()>>) {
     let mut cluster = HashMap::new();
-    
+
     for i in 0..nodes {
         cluster.insert(i, format!("127.0.0.1:{}", start_port + i).parse().unwrap());
-    };
+    }
 
     let client = Client::new(cluster.clone());
 
