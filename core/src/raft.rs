@@ -11,7 +11,7 @@ pub enum Role {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogEntry {
-    pub command: String,
+    pub command: Vec<u8>,
     pub term: usize,
 }
 
@@ -34,7 +34,7 @@ pub enum RaftRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct CommandRequest {
-    pub command: String,
+    pub command: Vec<u8>,
 }
 
 /// potential optimization:
@@ -50,7 +50,7 @@ pub struct CommandRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CommandResponse {
-    Result(String),
+    Result(Vec<u8>),
     NotLeader(NodeID),
     Unavailable,
     Failed,

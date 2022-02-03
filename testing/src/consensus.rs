@@ -11,12 +11,12 @@ fn test_consensus() {
     thread::sleep(Duration::from_secs(3));
 
     for i in 0..100 {
-        client.apply_command(CommandRequest { command: format!("SET X {i}") }).unwrap();
+        client.apply_command(CommandRequest { command: format!("SET X {i}").into() }).unwrap();
 
-        let resp = client.apply_command(CommandRequest { command: format!("GET X") }).unwrap();
+        let resp = client.apply_command(CommandRequest { command: format!("GET X").into() }).unwrap();
 
         match resp {
-            CommandResponse::Result(res) => assert_eq!(res, i.to_string()),
+            CommandResponse::Result(res) => assert_eq!(res, i.to_string().as_bytes().to_vec()),
             _ => panic!("Unexpected command response type: {resp:?}"),
         }
     }

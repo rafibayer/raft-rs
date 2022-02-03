@@ -22,7 +22,7 @@ use self::config::{Config, InternalConfig};
 
 type SyncConnection = Sender<RaftRequest>;
 
-pub struct Node<S: Storage<String, String>> {
+pub struct Node<S: Storage> {
     // must be stable storage
     pub id: NodeID,
     current_term: usize,
@@ -58,7 +58,7 @@ pub struct Node<S: Storage<String, String>> {
     shutdown_signal: Sender<()>,
 }
 
-impl<S: Storage<String, String>> Node<S> {
+impl<S: Storage> Node<S> {
     pub fn new(id: usize, config: Config, state: S) -> Self {
         let (tx_shutdown, rx_shutdown) = mpsc::channel();
 
@@ -438,7 +438,7 @@ impl<S: Storage<String, String>> Node<S> {
         if leader_commit > self.commit_length {
             for i in self.commit_length..leader_commit - 1 {
                 self.state
-                    .apply_command(self.log[i].command.clone())
+                    .apply_command(&self.log[i].command)
                     .expect("err applying command");
             }
 
@@ -489,7 +489,7 @@ impl<S: Storage<String, String>> Node<S> {
                 log::info!("{} leader committing log {}", self.info(), self.commit_length);
                 let result = self
                     .state
-                    .apply_command(self.log[self.commit_length].command.clone())
+                    .apply_command(&self.log[self.commit_length].command)
                     .expect("err applying command");
 
                 self.notify(

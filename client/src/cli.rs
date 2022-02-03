@@ -28,7 +28,7 @@ impl Command {
     pub fn execute(self, client: &mut Client) -> Result<String, Box<dyn Error>> {
         match self {
             Command::Execute { command } => {
-                Ok(format!("{:?}", client.apply_command(CommandRequest { command })?))
+                Ok(format!("{:?}", client.apply_command(CommandRequest { command: command.as_bytes().to_vec() })?))
             }
             Command::Shutdown { node } => {
                 Ok(format!("{:?}", client.admin(node, AdminRequest::Shutdown)?))
